@@ -20,7 +20,7 @@ Multi-MCP is a Python-based proxy server that acts as a single MCP (Model Contex
 - **Tool Namespacing**: Tools are namespaced as `server_name_tool_name` to avoid conflicts when multiple servers expose tools with the same name
 - **Transport Flexibility**: Supports both STDIO (for CLI/pipe-based) and SSE (for HTTP/network-based) communication
 - **Dynamic Server Management**: Can add/remove MCP servers at runtime via HTTP API (SSE mode only)
-- **Capability Aggregation**: Proxies and combines tools, prompts, and resources from all connected backend servers
+- **Capability Aggregation**: Proxies and combines tools, prompts, and resources from all connected backend servers.
 
 ## Development Commands
 
