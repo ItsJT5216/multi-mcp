@@ -72,7 +72,7 @@ jobs:
           python-version: '3.12'
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v10.1.0
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
         with:
           version: 'latest'
 
@@ -120,25 +120,30 @@ jobs:
       - name: Run vulnerability scan and fix (full/security mode)
         if: inputs.mode != 'audit-only'
         id: security-fix
+        env:
+          INPUT_VULNERABILITIES: ${{ inputs.vulnerabilities }}
+          INPUT_MODE: ${{ inputs.mode || 'full' }}
+          INPUT_VERBOSE: ${{ inputs.verbose }}
+          INPUT_VULNERABILITY_SERVICE: ${{ inputs.vulnerability_service || 'pypi' }}
         run: |
           source .venv/bin/activate
           VERBOSE_FLAG=""
-          if [ "${{ inputs.verbose }}" = "true" ]; then
+          if [ "$INPUT_VERBOSE" = "true" ]; then
             VERBOSE_FLAG="-v"
           fi
 
-          SERVICE="${{ inputs.vulnerability_service || 'pypi' }}"
-          MODE="${{ inputs.mode || 'full' }}"
+          SERVICE="$INPUT_VULNERABILITY_SERVICE"
+          MODE="$INPUT_MODE"
 
           echo "🔍 Running pip-audit with --fix in $MODE mode..."
 
           # Build ignore flags for specified vulnerabilities
           IGNORE_FLAGS=""
-          if [ -n "${{ inputs.vulnerabilities }}" ]; then
+          if [ -n "$INPUT_VULNERABILITIES" ]; then
             # If vulnerabilities are specified in security mode, we DON'T ignore them
             # Instead, we run a targeted audit. For now, pip-audit doesn't support
             # "only fix these" so we run full fix and note the targeted CVEs.
-            echo "📋 Targeted vulnerabilities: ${{ inputs.vulnerabilities }}"
+            echo "📋 Targeted vulnerabilities: $INPUT_VULNERABILITIES"
           fi
 
           # First, run audit to see current state
@@ -229,7 +234,7 @@ jobs:
 
       - name: Create Pull Request
         if: inputs.mode != 'audit-only' && steps.security-fix.outputs.packages_fixed == 'true'
-        uses: peter-evans/create-pull-request@v8
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           commit-message: 'security: fix vulnerable Python dependencies'
@@ -262,17 +267,22 @@ jobs:
             automated
 
       - name: Summary
+        env:
+          INPUT_MODE: ${{ inputs.mode || 'full' }}
+          INPUT_VULNERABILITY_SERVICE: ${{ inputs.vulnerability_service || 'pypi' }}
+          INPUT_VERBOSE: ${{ inputs.verbose || 'false' }}
+          PACKAGES_FIXED: ${{ steps.security-fix.outputs.packages_fixed }}
         run: |
           echo "## 🔒 Python Dependency Security Audit Summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- **Mode**: ${{ inputs.mode || 'full' }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Vulnerability Service**: ${{ inputs.vulnerability_service || 'pypi' }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Verbose**: ${{ inputs.verbose || 'false' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Mode**: $INPUT_MODE" >> $GITHUB_STEP_SUMMARY
+          echo "- **Vulnerability Service**: $INPUT_VULNERABILITY_SERVICE" >> $GITHUB_STEP_SUMMARY
+          echo "- **Verbose**: $INPUT_VERBOSE" >> $GITHUB_STEP_SUMMARY
 
-          if [ "${{ inputs.mode }}" = "audit-only" ]; then
+          if [ "$INPUT_MODE" = "audit-only" ]; then
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "📋 Audit-only mode: No fixes were applied" >> $GITHUB_STEP_SUMMARY
-          elif [ "${{ steps.security-fix.outputs.packages_fixed }}" = "true" ]; then
+          elif [ "$PACKAGES_FIXED" = "true" ]; then
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "✅ Security updates applied - PR created" >> $GITHUB_STEP_SUMMARY
           else
