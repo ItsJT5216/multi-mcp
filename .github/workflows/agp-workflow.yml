@@ -67,7 +67,7 @@ permissions:
   id-token: write  # Required for Sonatype Guide OIDC authentication
 
 concurrency:
-  group: agp-workflow
+  group: agp-workflow-${{ github.run_id }}
   cancel-in-progress: false
 
 jobs:
