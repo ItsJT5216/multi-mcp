@@ -83,6 +83,7 @@ servers:
     url: https://mcp.exa.ai/mcp?tools=web_search_exa,get_code_context_exa
     always_on: false          # lazy: connects only when called
     idle_timeout_minutes: 5
+    tool_call_timeout_seconds: 60   # optional: fail hung tool calls after 60s
     tools:
       web_search_exa:
         enabled: true
@@ -106,6 +107,8 @@ servers:
 | No `tools` key | All tools pass through (default) |
 
 To disable a tool, just set `enabled: false` and save. Takes effect on next `multi-mcp start`.
+
+**Per-server timeouts:** set `tool_call_timeout_seconds` on a server to bound how long a tool call may take. When unset (default), calls wait indefinitely. When set, a hung backend returns a timeout error instead of stalling the request, and repeated timeouts trip the proxy's circuit breaker (auto-quarantine after 3 consecutive failures).
 
 ---
 

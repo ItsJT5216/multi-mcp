@@ -755,6 +755,7 @@ class MCPClientManager:
         # Eager mode: connect immediately with per-server isolation
         for name, server in config.get("mcpServers", {}).items():
             self.tool_filters[name] = self._parse_tool_filter(server)
+            self.server_configs.setdefault(name, server)
             if name in self.clients:
                 self.logger.warning(
                     f"⚠️ Client '{name}' already exists and will be overridden."

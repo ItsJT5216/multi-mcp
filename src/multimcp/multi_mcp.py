@@ -480,6 +480,51 @@ class MultiMCP:
         )
         return config
 
+    async def _connect_always_on_servers(self, yaml_config: MultiMCPConfig) -> None:
+        """Connect all always_on servers concurrently.
+
+        Connections run in parallel (bounded by the client manager's connection
+        semaphore) so startup latency is the slowest server, not the sum of all
+        servers. Failures are isolated per server.
+        """
+        async def _connect_one(server_name: str) -> None:
+            try:
+                client = await self.client_manager.get_or_create_client(server_name)
+                if self.proxy:
+                    await self.proxy.initialize_single_client(server_name, client)
+                    await self.proxy._send_tools_list_changed()
+                    self.logger.info(f"✅ Always-on server '{server_name}' connected")
+            except Exception as e:
+                self.logger.warning(f"⚠️ Always-on '{server_name}' failed to connect: {e}")
+
+        await asyncio.gather(
+            *(
+                _connect_one(server_name)
+                for server_name, server_config in yaml_config.servers.items()
+                if server_config.always_on
+            )
+        )
+
+    async def _connect_json_config_servers(self, yaml_config: MultiMCPConfig) -> None:
+        """Eagerly connect all servers from an explicit --config JSON file, concurrently.
+
+        Connections run in parallel (bounded by the connection semaphore) so
+        startup latency is the slowest server, not the sum of all servers.
+        Failures are isolated per server (logged, others still connect).
+        """
+        async def _connect_one(server_name: str) -> None:
+            try:
+                client = await self.client_manager.get_or_create_client(server_name)
+                await self.proxy.initialize_single_client(server_name, client)
+            except Exception as e:
+                self.logger.warning(
+                    f"⚠️ Failed to connect '{server_name}' during JSON-config init: {e}"
+                )
+
+        await asyncio.gather(
+            *(_connect_one(name) for name in list(yaml_config.servers.keys()))
+        )
+
     async def run(self):
         """Entry point to run the MultiMCP server: loads config, initializes clients, starts server."""
         self.logger.info(
@@ -534,19 +579,8 @@ class MultiMCP:
         }
         self._track_task(self.client_manager.start_always_on_watchdog(always_on_configs), "always-on-watchdog")
 
-        # Background: connect always_on servers after proxy starts
-        async def _connect_always_on() -> None:
-            for server_name, server_config in yaml_config.servers.items():
-                if not server_config.always_on:
-                    continue
-                try:
-                    client = await self.client_manager.get_or_create_client(server_name)
-                    if self.proxy:
-                        await self.proxy.initialize_single_client(server_name, client)
-                        await self.proxy._send_tools_list_changed()
-                        self.logger.info(f"✅ Always-on server '{server_name}' connected")
-                except Exception as e:
-                    self.logger.warning(f"⚠️ Always-on '{server_name}' failed to connect: {e}")
+        # Background: connect always_on servers after proxy starts (concurrently —
+        # bounded by the client manager's connection semaphore, failures isolated)
 
         try:
             self.proxy = await MCPProxyServer.create(self.client_manager)
@@ -640,16 +674,11 @@ class MultiMCP:
 
             # When --config is given, load_tools_from_yaml is a no-op (no cached tool
             # metadata in the JSON file). Eagerly connect all servers now so their tools
-            # populate tool_to_server before we start serving requests.
+            # populate tool_to_server before we start serving requests. Connections run
+            # concurrently (bounded by the connection semaphore) so startup latency is
+            # the slowest server, not the sum of all servers.
             if self.settings.config:
-                for server_name in list(yaml_config.servers.keys()):
-                    try:
-                        client = await self.client_manager.get_or_create_client(server_name)
-                        await self.proxy.initialize_single_client(server_name, client)
-                    except Exception as e:
-                        self.logger.warning(
-                            f"⚠️ Failed to connect '{server_name}' during JSON-config init: {e}"
-                        )
+                await self._connect_json_config_servers(yaml_config)
                 # Rebuild the retrieval index with the freshly discovered tools so the
                 # pipeline catalog is populated before the first tools/list request.
                 if self.proxy.tool_to_server:
@@ -672,7 +701,7 @@ class MultiMCP:
             self.client_manager.on_server_reconnected = _on_server_reconnected
 
             # Connect always_on servers in background (don't block startup)
-            self._track_task(_connect_always_on(), "connect-always-on")
+            self._track_task(self._connect_always_on_servers(yaml_config), "connect-always-on")
 
             # Wait for server or shutdown signal
             server_task = asyncio.create_task(self.start_server())

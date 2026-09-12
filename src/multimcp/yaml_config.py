@@ -23,6 +23,14 @@ class ServerConfig(BaseModel):
     type: Literal["stdio", "sse", "http", "streamablehttp"] = "stdio"
     always_on: bool = False
     idle_timeout_minutes: int = 5
+    tool_call_timeout_seconds: Optional[float] = Field(default=None, gt=0)
+    """Max seconds to wait for a tool call response from this server.
+
+    When *None* (the default) tool calls wait indefinitely (previous behavior).
+    When set, a hung backend returns a timeout error to the caller instead of
+    stalling the request forever; repeated timeouts trip the proxy's
+    circuit breaker and auto-quarantine the tool.
+    """
     tools: dict[str, ToolEntry] = Field(default_factory=dict)
     triggers: list[str] = Field(default_factory=list)
 
