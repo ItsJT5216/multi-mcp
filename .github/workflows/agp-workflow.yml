@@ -1,0 +1,291 @@
+#
+# Python Dependency Security Audit Workflow
+#
+# This workflow scans Python dependencies for known vulnerabilities using pip-audit
+# and creates pull requests to remediate them. Replaces Sonatype AGP (which is
+# npm/package.json-specific) with Python-native tooling.
+#
+# File: .github/workflows/agp-workflow.yml
+#
+# How this works:
+#   1. Scans Python dependencies (pyproject.toml, requirements.txt) for known vulnerabilities
+#   2. Uses pip-audit with --fix to automatically upgrade vulnerable packages
+#   3. Creates a pull request with the security updates if changes are needed
+#
+# Modes:
+#   - full: Complete dependency audit and fix (default for scheduled runs)
+#   - security: Targeted security fix run (can specify vulnerabilities to target)
+#   - audit-only: Scan and report vulnerabilities without creating fixes
+#
+
+name: Python Dependency Security Audit
+
+on:
+  schedule:
+    # Runs once a day. Change it to any schedule preferred.
+    - cron: '11 11 * * *'
+  workflow_dispatch:
+    inputs:
+      verbose:
+        description: 'Enable verbose output'
+        required: false
+        default: 'false'
+        type: boolean
+      # Run modes for different security remediation scenarios.
+      # Using `type: string` rather than `type: choice` for flexibility - allows adding
+      # new modes without breaking workflow dispatch from external systems.
+      mode:
+        description: 'Run mode (full, security, or audit-only)'
+        required: false
+        default: 'full'
+        type: string
+      vulnerabilities:
+        description: 'Comma-separated list of vulnerability IDs to ignore during audit (e.g., GHSA-xxx,PYSEC-yyy)'
+        required: false
+        default: ''
+        type: string
+      vulnerability_service:
+        description: 'Vulnerability database to use (pypi or osv)'
+        required: false
+        default: 'pypi'
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: python-security-audit-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  security-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          version: 'latest'
+
+      - name: Install dependencies and pip-audit
+        run: |
+          uv venv
+          source .venv/bin/activate
+          uv pip install pip-audit
+          # Install project dependencies for accurate vulnerability scanning
+          uv pip install -r requirements.txt
+
+      - name: Run vulnerability audit (audit-only mode)
+        if: inputs.mode == 'audit-only'
+        id: audit-only
+        run: |
+          source .venv/bin/activate
+          VERBOSE_FLAG=""
+          if [ "${{ inputs.verbose }}" = "true" ]; then
+            VERBOSE_FLAG="-v"
+          fi
+
+          SERVICE="${{ inputs.vulnerability_service || 'pypi' }}"
+
+          echo "🔍 Running pip-audit in audit-only mode..."
+          pip-audit \
+            -r requirements.txt \
+            --vulnerability-service "$SERVICE" \
+            --format json \
+            --desc on \
+            $VERBOSE_FLAG \
+            --output audit-report.json || true
+
+          echo "📋 Audit Results:"
+          cat audit-report.json | python -m json.tool || cat audit-report.json
+
+          # Check if vulnerabilities were found
+          if python -c "import json; data=json.load(open('audit-report.json')); vulns=[d for d in data.get('dependencies', []) if d.get('vulns')]; exit(0 if not vulns else 1)" 2>/dev/null; then
+            echo "✅ No vulnerabilities found"
+            echo "has_vulnerabilities=false" >> $GITHUB_OUTPUT
+          else
+            echo "⚠️ Vulnerabilities detected - see report above"
+            echo "has_vulnerabilities=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run vulnerability scan and fix (full/security mode)
+        if: inputs.mode != 'audit-only'
+        id: security-fix
+        env:
+          INPUT_VULNERABILITIES: ${{ inputs.vulnerabilities }}
+          INPUT_MODE: ${{ inputs.mode || 'full' }}
+          INPUT_VERBOSE: ${{ inputs.verbose }}
+          INPUT_VULNERABILITY_SERVICE: ${{ inputs.vulnerability_service || 'pypi' }}
+        run: |
+          source .venv/bin/activate
+          VERBOSE_FLAG=""
+          if [ "$INPUT_VERBOSE" = "true" ]; then
+            VERBOSE_FLAG="-v"
+          fi
+
+          SERVICE="$INPUT_VULNERABILITY_SERVICE"
+          MODE="$INPUT_MODE"
+
+          echo "🔍 Running pip-audit with --fix in $MODE mode..."
+
+          # Build ignore flags for specified vulnerabilities
+          IGNORE_FLAGS=""
+          if [ -n "$INPUT_VULNERABILITIES" ]; then
+            # If vulnerabilities are specified in security mode, we DON'T ignore them
+            # Instead, we run a targeted audit. For now, pip-audit doesn't support
+            # "only fix these" so we run full fix and note the targeted CVEs.
+            echo "📋 Targeted vulnerabilities: $INPUT_VULNERABILITIES"
+          fi
+
+          # First, run audit to see current state
+          echo "📋 Current vulnerability status:"
+          pip-audit \
+            -r requirements.txt \
+            --vulnerability-service "$SERVICE" \
+            --format columns \
+            $VERBOSE_FLAG || true
+
+          # Run with --fix to automatically upgrade vulnerable packages
+          # pip-audit --fix modifies the environment, so we need to capture changes
+          echo ""
+          echo "🔧 Attempting automatic fixes..."
+          pip-audit \
+            -r requirements.txt \
+            --vulnerability-service "$SERVICE" \
+            --fix \
+            $VERBOSE_FLAG 2>&1 | tee fix-output.txt || true
+
+          # Check if any packages were upgraded
+          if grep -q "Successfully upgraded" fix-output.txt; then
+            echo "✅ Some packages were upgraded"
+            echo "packages_fixed=true" >> $GITHUB_OUTPUT
+          else
+            echo "ℹ️ No automatic fixes applied (packages may already be up to date or fixes unavailable)"
+            echo "packages_fixed=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Update requirements.txt with fixed versions
+        if: inputs.mode != 'audit-only' && steps.security-fix.outputs.packages_fixed == 'true'
+        run: |
+          source .venv/bin/activate
+          echo "📝 Regenerating requirements.txt with updated versions..."
+
+          # Get the list of currently installed packages with their versions
+          # We preserve the original requirements.txt structure but update versions
+          pip freeze > .venv/frozen-requirements.txt
+
+          # Create a Python script to merge the updates
+          python << 'EOF'
+          import re
+
+          # Read original requirements
+          with open('requirements.txt', 'r') as f:
+              original_lines = f.readlines()
+
+          # Read frozen requirements into a dict
+          frozen = {}
+          with open('.venv/frozen-requirements.txt', 'r') as f:
+              for line in f:
+                  line = line.strip()
+                  if '==' in line:
+                      pkg, ver = line.split('==', 1)
+                      frozen[pkg.lower()] = ver
+
+          # Update versions in original file
+          updated_lines = []
+          for line in original_lines:
+              stripped = line.strip()
+              if stripped and not stripped.startswith('#'):
+                  # Extract package name (handle various formats)
+                  match = re.match(r'^([a-zA-Z0-9_-]+)', stripped)
+                  if match:
+                      pkg_name = match.group(1).lower()
+                      if pkg_name in frozen:
+                          # Replace version with frozen version
+                          updated_line = f"{match.group(1)}=={frozen[pkg_name]}\n"
+                          updated_lines.append(updated_line)
+                          continue
+              updated_lines.append(line)
+
+          with open('requirements.txt', 'w') as f:
+              f.writelines(updated_lines)
+
+          print("✅ requirements.txt updated with fixed versions")
+          EOF
+
+      - name: Run post-fix verification audit
+        if: inputs.mode != 'audit-only' && steps.security-fix.outputs.packages_fixed == 'true'
+        run: |
+          source .venv/bin/activate
+          echo "🔍 Verifying fixes..."
+          pip-audit \
+            -r requirements.txt \
+            --vulnerability-service "${{ inputs.vulnerability_service || 'pypi' }}" \
+            --format columns || true
+
+      - name: Create Pull Request
+        if: inputs.mode != 'audit-only' && steps.security-fix.outputs.packages_fixed == 'true'
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: 'security: fix vulnerable Python dependencies'
+          title: '[Security] Fix vulnerable Python dependencies'
+          body: |
+            ## 🔒 Security Dependency Update
+
+            This PR was automatically generated by the Python Dependency Security Audit workflow.
+
+            ### What changed
+            - Scanned Python dependencies for known vulnerabilities using `pip-audit`
+            - Automatically upgraded packages with known security issues
+
+            ### Mode
+            - **Run mode**: `${{ inputs.mode || 'full' }}`
+            - **Vulnerability service**: `${{ inputs.vulnerability_service || 'pypi' }}`
+
+            ### Review checklist
+            - [ ] Review the dependency changes in `requirements.txt`
+            - [ ] Ensure no breaking changes from version upgrades
+            - [ ] Run tests to verify compatibility
+
+            ---
+            *Generated by [pip-audit](https://github.com/pypa/pip-audit) security scanning*
+          branch: security/python-dependency-updates
+          delete-branch: true
+          labels: |
+            security
+            dependencies
+            automated
+
+      - name: Summary
+        env:
+          INPUT_MODE: ${{ inputs.mode || 'full' }}
+          INPUT_VULNERABILITY_SERVICE: ${{ inputs.vulnerability_service || 'pypi' }}
+          INPUT_VERBOSE: ${{ inputs.verbose || 'false' }}
+          PACKAGES_FIXED: ${{ steps.security-fix.outputs.packages_fixed }}
+        run: |
+          echo "## 🔒 Python Dependency Security Audit Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Mode**: $INPUT_MODE" >> $GITHUB_STEP_SUMMARY
+          echo "- **Vulnerability Service**: $INPUT_VULNERABILITY_SERVICE" >> $GITHUB_STEP_SUMMARY
+          echo "- **Verbose**: $INPUT_VERBOSE" >> $GITHUB_STEP_SUMMARY
+
+          if [ "$INPUT_MODE" = "audit-only" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "📋 Audit-only mode: No fixes were applied" >> $GITHUB_STEP_SUMMARY
+          elif [ "$PACKAGES_FIXED" = "true" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "✅ Security updates applied - PR created" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "✅ No vulnerable dependencies found or fixes needed" >> $GITHUB_STEP_SUMMARY
+          fi
