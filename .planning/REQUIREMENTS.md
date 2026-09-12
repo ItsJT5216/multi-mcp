@@ -14,7 +14,7 @@
 - [ ] **CATALOG-01**: System defines `ToolDoc` dataclass with fields `tool_key`, `tool_name`, `namespace`, `description`, `parameter_names`, `retrieval_aliases`
 - [ ] **CATALOG-02**: System defines `ToolCatalogSnapshot` with immutable `schema_hash` (SHA-256), `version`, `built_at`, and `docs: list[ToolDoc]`
 - [ ] **CATALOG-03**: System implements `catalog.py` with `build_snapshot(registry)` converting `dict[str, ToolMapping]` → `ToolCatalogSnapshot`
-- [ ] **CATALOG-04**: System extends `RetrievalConfig` with Phase 2 fields (`shadow_mode`, `scorer`, `fallback_tier`, `dynamic_k`) while maintaining backward compatibility with existing YAML configs
+- [x] **CATALOG-04**: System extends `RetrievalConfig` with Phase 2 fields (`shadow_mode`, `scorer`, `fallback_tier`, `dynamic_k`) while maintaining backward compatibility with existing YAML configs
 
 ### Session Routing State (SESSION)
 
@@ -56,8 +56,8 @@
 
 ### Pipeline Wiring (WIRE)
 
-- [ ] **WIRE-01**: System wires `RetrievalPipeline` into `MCPProxyServer.retrieval_pipeline` in `multi_mcp.py` (replacing TYPE_CHECKING-only import)
-- [ ] **WIRE-02**: System wires catalog snapshot rebuild on `tool_to_server` changes via `register_client()`/`unregister_client()`
+- [x] **WIRE-01**: System wires `RetrievalPipeline` into `MCPProxyServer.retrieval_pipeline` in `multi_mcp.py` (replacing TYPE_CHECKING-only import)
+- [x] **WIRE-02**: System wires catalog snapshot rebuild on `tool_to_server` changes via `register_client()`/`unregister_client()`
 
 ### Testing (TEST)
 

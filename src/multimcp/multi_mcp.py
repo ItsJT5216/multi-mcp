@@ -43,20 +43,6 @@ class MCPSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="MULTI_MCP_")
 
 
-def _make_startup_retrieval_config():
-    """Return the RetrievalConfig used at server startup (shadow mode, pre-Phase-9).
-
-    Extracted as a module-level factory so tests can assert on the runtime object's
-    field values rather than inspecting source text.
-    """
-    from src.multimcp.retrieval.models import RetrievalConfig
-
-    return RetrievalConfig(
-        enabled=True,
-        shadow_mode=True,
-        rollout_stage="shadow",
-    )
-
 
 class MultiMCP:
     def __init__(self, **settings: Any):
@@ -192,10 +178,17 @@ class MultiMCP:
 
         # Bare format: every top-level key is a server name (Claude plugins)
         if all(isinstance(v, dict) for v in data.values()) and data:
-            # Verify at least one entry looks like a server config
+            # Only entries that look like server configs are servers; this
+            # excludes sibling settings blocks (e.g. top-level "retrieval")
+            # from being misparsed as servers.
             server_keys = {"command", "args", "url", "type"}
-            if any(server_keys & set(v.keys()) for v in data.values()):
-                return MultiMCP._normalize_server_entries(data)
+            bare_servers = {
+                name: entry
+                for name, entry in data.items()
+                if server_keys & set(entry.keys())
+            }
+            if bare_servers:
+                return MultiMCP._normalize_server_entries(bare_servers)
         return {}
 
     @staticmethod
@@ -265,7 +258,7 @@ class MultiMCP:
             if not cfg_path.exists():
                 continue
             try:
-                with open(cfg_path) as f:
+                with open(cfg_path, encoding="utf-8") as f:
                     data = json.load(f)
 
                 # Zed uses "context_servers" with a slightly different shape
@@ -318,7 +311,7 @@ class MultiMCP:
         disabled_plugins: set[str] = set()
         if settings_path.exists():
             try:
-                with open(settings_path) as f:
+                with open(settings_path, encoding="utf-8") as f:
                     settings = json.load(f)
                 for plugin_id, is_enabled in settings.get("enabledPlugins", {}).items():
                     if not is_enabled:
@@ -340,7 +333,7 @@ class MultiMCP:
                 if plugin_id in disabled_plugins:
                     continue
             try:
-                with open(mcp_json) as f:
+                with open(mcp_json, encoding="utf-8") as f:
                     data = json.load(f)
                 extracted = self._extract_mcp_servers(data)
                 if extracted:
@@ -470,11 +463,67 @@ class MultiMCP:
             )
             if server_config.always_on:
                 self.client_manager.always_on_servers.add(server_name)
+        # Parse retrieval settings from JSON if present.
+        if "retrieval" in json_data:
+            from src.multimcp.yaml_config import RetrievalSettings
+            try:
+                config.retrieval = RetrievalSettings(**json_data["retrieval"])
+            except ValidationError as e:
+                self.logger.error(
+                    "Failed to parse retrieval settings from JSON config; "
+                    "please fix the 'retrieval' section and try again."
+                )
+                raise RuntimeError("Invalid retrieval settings in JSON config") from e
         self.logger.info(
             f"📄 Using JSON config: {self.settings.config} "
             f"({len(config.servers)} server(s): {', '.join(config.servers)})"
         )
         return config
+
+    async def _connect_always_on_servers(self, yaml_config: MultiMCPConfig) -> None:
+        """Connect all always_on servers concurrently.
+
+        Connections run in parallel (bounded by the client manager's connection
+        semaphore) so startup latency is the slowest server, not the sum of all
+        servers. Failures are isolated per server.
+        """
+        async def _connect_one(server_name: str) -> None:
+            try:
+                client = await self.client_manager.get_or_create_client(server_name)
+                if self.proxy:
+                    await self.proxy.initialize_single_client(server_name, client)
+                    await self.proxy._send_tools_list_changed()
+                    self.logger.info(f"✅ Always-on server '{server_name}' connected")
+            except Exception as e:
+                self.logger.warning(f"⚠️ Always-on '{server_name}' failed to connect: {e}")
+
+        await asyncio.gather(
+            *(
+                _connect_one(server_name)
+                for server_name, server_config in yaml_config.servers.items()
+                if server_config.always_on
+            )
+        )
+
+    async def _connect_json_config_servers(self, yaml_config: MultiMCPConfig) -> None:
+        """Eagerly connect all servers from an explicit --config JSON file, concurrently.
+
+        Connections run in parallel (bounded by the connection semaphore) so
+        startup latency is the slowest server, not the sum of all servers.
+        Failures are isolated per server (logged, others still connect).
+        """
+        async def _connect_one(server_name: str) -> None:
+            try:
+                client = await self.client_manager.get_or_create_client(server_name)
+                await self.proxy.initialize_single_client(server_name, client)
+            except Exception as e:
+                self.logger.warning(
+                    f"⚠️ Failed to connect '{server_name}' during JSON-config init: {e}"
+                )
+
+        await asyncio.gather(
+            *(_connect_one(name) for name in list(yaml_config.servers.keys()))
+        )
 
     async def run(self):
         """Entry point to run the MultiMCP server: loads config, initializes clients, starts server."""
@@ -530,42 +579,61 @@ class MultiMCP:
         }
         self._track_task(self.client_manager.start_always_on_watchdog(always_on_configs), "always-on-watchdog")
 
-        # Background: connect always_on servers after proxy starts
-        async def _connect_always_on() -> None:
-            for server_name, server_config in yaml_config.servers.items():
-                if not server_config.always_on:
-                    continue
-                try:
-                    client = await self.client_manager.get_or_create_client(server_name)
-                    if self.proxy:
-                        await self.proxy.initialize_single_client(server_name, client)
-                        await self.proxy._send_tools_list_changed()
-                        self.logger.info(f"✅ Always-on server '{server_name}' connected")
-                except Exception as e:
-                    self.logger.warning(f"⚠️ Always-on '{server_name}' failed to connect: {e}")
+        # Background: connect always_on servers after proxy starts (concurrently —
+        # bounded by the client manager's connection semaphore, failures isolated)
 
         try:
             self.proxy = await MCPProxyServer.create(self.client_manager)
             self.client_manager._on_server_disconnected = self.proxy._on_server_disconnected
 
-            # Initialize retrieval pipeline — pre-Phase-9 coherent shadow state.
-            # enabled=True: pipeline runs scoring and logging (data collection active).
-            # shadow_mode=True + rollout_stage="shadow": score/log as normal BUT return
-            # all tools (no active-set filtering). Phase 9 will wire the rollout YAML
-            # and promote to canary/ga once config plumbing is complete.
+            # Initialize retrieval pipeline from YAML config.
+            # yaml_config is the MultiMCPConfig local variable loaded earlier in run().
+            # self.config is MCPSettings (BaseSettings) and does NOT have a retrieval field.
+            # When no retrieval: block appears in YAML, RetrievalSettings() defaults apply
+            # (enabled=False, shadow_mode=False) — preserving full backward compatibility.
             from src.multimcp.retrieval.pipeline import RetrievalPipeline
             from src.multimcp.retrieval.bmx_retriever import BMXFRetriever
+            from src.multimcp.retrieval.keyword import KeywordRetriever
+            from src.multimcp.retrieval.base import PassthroughRetriever
             from src.multimcp.retrieval.logging import NullLogger, FileRetrievalLogger
             from src.multimcp.retrieval.session import SessionStateManager
-            retrieval_config = _make_startup_retrieval_config()
-            bmxf_retriever = BMXFRetriever(config=retrieval_config)
-            self.bmxf_retriever = bmxf_retriever
+            from src.multimcp.retrieval.models import RetrievalConfig
+            from src.multimcp.retrieval.metrics import RollingMetrics
+
+            # Build RetrievalConfig from YAML settings.
+            yaml_retrieval = yaml_config.retrieval  # RetrievalSettings — defaults to enabled=False when absent
+            retrieval_config = RetrievalConfig(
+                enabled=yaml_retrieval.enabled,
+                top_k=yaml_retrieval.top_k,
+                full_description_count=yaml_retrieval.full_description_count,
+                anchor_tools=yaml_retrieval.anchor_tools,
+                shadow_mode=yaml_retrieval.shadow_mode,
+                scorer=yaml_retrieval.scorer,
+                max_k=yaml_retrieval.max_k,
+                enable_routing_tool=yaml_retrieval.enable_routing_tool,
+                enable_telemetry=yaml_retrieval.enable_telemetry,
+                telemetry_poll_interval=yaml_retrieval.telemetry_poll_interval,
+                canary_percentage=yaml_retrieval.canary_percentage,
+                rollout_stage=yaml_retrieval.rollout_stage,
+            )
+
+            if retrieval_config.scorer == "bmxf":
+                retriever = BMXFRetriever(config=retrieval_config)
+                self.bmxf_retriever = retriever
+            elif retrieval_config.scorer == "keyword":
+                retriever = KeywordRetriever(config=retrieval_config)
+                self.bmxf_retriever = None
+            else:
+                retriever = PassthroughRetriever()
+                self.bmxf_retriever = None
 
             # Build the initial index from whatever tools are already registered.
             # rebuild_catalog() is called again after always_on servers connect so
-            # the index stays in sync. Called here to populate _env_index / _nl_index.
+            # the index stays in sync. Called here when the active retriever supports it.
             if self.proxy.tool_to_server:
-                bmxf_retriever.rebuild_index(self.proxy.tool_to_server)
+                rebuild = getattr(retriever, "rebuild_index", None)
+                if rebuild is not None:
+                    rebuild(self.proxy.tool_to_server)
 
             # Wire TelemetryScanner so workspace roots drive env-query tokens.
             telemetry_scanner = None
@@ -575,22 +643,30 @@ class MultiMCP:
             except Exception as _te:
                 self.logger.warning(f"⚠️ TelemetryScanner unavailable: {_te}")
 
-            # Issue D: wire FileRetrievalLogger instead of NullLogger
-            _log_path = Path("logs/retrieval_rankings.jsonl")
-            _log_path.parent.mkdir(parents=True, exist_ok=True)
-            try:
-                retrieval_logger = FileRetrievalLogger(_log_path)
-            except Exception as _le:
-                self.logger.warning(f"⚠️ FileRetrievalLogger unavailable, using NullLogger: {_le}")
+            # Logger selection from YAML log_path (replaces hardcoded _log_path).
+            # When log_path is set, use FileRetrievalLogger; otherwise NullLogger.
+            if yaml_retrieval.log_path:
+                _log_path = Path(yaml_retrieval.log_path)
+                _log_path.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    retrieval_logger = FileRetrievalLogger(_log_path)
+                except Exception as _le:
+                    self.logger.warning(f"⚠️ FileRetrievalLogger unavailable: {_le}")
+                    retrieval_logger = NullLogger()
+            else:
                 retrieval_logger = NullLogger()
 
+            # RollingMetrics — created only when pipeline is enabled (required for rescore alerting).
+            rolling_metrics = RollingMetrics(window_seconds=1800) if retrieval_config.enabled else None
+
             self.proxy.retrieval_pipeline = RetrievalPipeline(
-                retriever=bmxf_retriever,
+                retriever=retriever,
                 session_manager=SessionStateManager(retrieval_config),
                 logger=retrieval_logger,
                 config=retrieval_config,
                 tool_registry=self.proxy.tool_to_server,
                 telemetry_scanner=telemetry_scanner,
+                rolling_metrics=rolling_metrics,
             )
 
             # Pre-populate tool list from YAML cache so tools are visible immediately
@@ -598,20 +674,18 @@ class MultiMCP:
 
             # When --config is given, load_tools_from_yaml is a no-op (no cached tool
             # metadata in the JSON file). Eagerly connect all servers now so their tools
-            # populate tool_to_server before we start serving requests.
+            # populate tool_to_server before we start serving requests. Connections run
+            # concurrently (bounded by the connection semaphore) so startup latency is
+            # the slowest server, not the sum of all servers.
             if self.settings.config:
-                for server_name in list(yaml_config.servers.keys()):
-                    try:
-                        client = await self.client_manager.get_or_create_client(server_name)
-                        await self.proxy.initialize_single_client(server_name, client)
-                    except Exception as e:
-                        self.logger.warning(
-                            f"⚠️ Failed to connect '{server_name}' during JSON-config init: {e}"
-                        )
+                await self._connect_json_config_servers(yaml_config)
                 # Rebuild the retrieval index with the freshly discovered tools so the
                 # pipeline catalog is populated before the first tools/list request.
                 if self.proxy.tool_to_server:
-                    bmxf_retriever.rebuild_index(self.proxy.tool_to_server)
+                    active_retriever = self.proxy.retrieval_pipeline.retriever
+                    rebuild = getattr(active_retriever, "rebuild_index", None)
+                    if rebuild is not None:
+                        rebuild(self.proxy.tool_to_server)
                     self.proxy.retrieval_pipeline.rebuild_catalog(self.proxy.tool_to_server)
 
             # Register watchdog callback so proxy tool mappings are refreshed after reconnect
@@ -627,7 +701,7 @@ class MultiMCP:
             self.client_manager.on_server_reconnected = _on_server_reconnected
 
             # Connect always_on servers in background (don't block startup)
-            self._track_task(_connect_always_on(), "connect-always-on")
+            self._track_task(self._connect_always_on_servers(yaml_config), "connect-always-on")
 
             # Wait for server or shutdown signal
             server_task = asyncio.create_task(self.start_server())
@@ -892,9 +966,9 @@ class MultiMCP:
                 )
                 for name, client in new_clients.items():
                     await self.proxy.register_client(name, client)
-                # Issue E: rebuild BMXF index after dynamic server add
-                if self.bmxf_retriever is not None and self.proxy.tool_to_server:
-                    self.bmxf_retriever.rebuild_index(self.proxy.tool_to_server)
+                # Rebuild the active retriever index after dynamic server add when supported.
+                if self.proxy.retrieval_pipeline is not None and self.proxy.tool_to_server:
+                    self.proxy.retrieval_pipeline.rebuild_catalog(self.proxy.tool_to_server)
                 return JSONResponse({"message": f"Added {list(new_clients.keys())}"})
             except ValueError as e:
                 # Security validation failure (command not allowed, SSRF attempt, etc.)
@@ -921,9 +995,9 @@ class MultiMCP:
 
             try:
                 await self.proxy.unregister_client(name)
-                # Issue E: rebuild BMXF index after dynamic server remove
-                if self.bmxf_retriever is not None and self.proxy.tool_to_server:
-                    self.bmxf_retriever.rebuild_index(self.proxy.tool_to_server)
+                # Rebuild the active retriever index after dynamic server remove when supported.
+                if self.proxy.retrieval_pipeline is not None and self.proxy.tool_to_server:
+                    self.proxy.retrieval_pipeline.rebuild_catalog(self.proxy.tool_to_server)
                 return JSONResponse(
                     {"message": f"Client '{name}' removed successfully"}
                 )

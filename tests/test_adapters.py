@@ -987,7 +987,11 @@ class TestBackupMechanism:
         assert bak.read_text(encoding="utf-8") == '{"mcpServers": {}}'
 
     def test_backup_uses_configured_backup_dir(self, tmp_path: Path) -> None:
-        """When backup_dir is set, .bak is written there instead."""
+        """When backup_dir is set, .bak is written there with a tool_name prefix.
+
+        The prefix prevents collisions when multiple tools share the same
+        config filename (e.g. ``settings.json``) in a common backup directory.
+        """
         src_dir = tmp_path / "config"
         src_dir.mkdir()
         bak_dir = tmp_path / "backups"
@@ -996,7 +1000,7 @@ class TestBackupMechanism:
         adapter = self._adapter()
         adapter.backup_dir = bak_dir
         adapter._backup(p)
-        bak = bak_dir / "settings.json.bak"
+        bak = bak_dir / "claude_desktop_settings.json.bak"
         assert bak.exists()
         assert not (src_dir / "settings.json.bak").exists()
 

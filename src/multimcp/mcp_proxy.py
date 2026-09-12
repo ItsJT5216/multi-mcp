@@ -3,6 +3,7 @@ import asyncio
 import hashlib
 import json
 import uuid
+from datetime import timedelta
 from mcp import server, types
 from mcp.client.session import ClientSession
 from mcp.server.session import ServerSession
@@ -148,18 +149,31 @@ class MCPProxyServer(server.Server):
                 )
 
     async def initialize_remote_clients(self) -> None:
-        """Initialize all remote clients and store their capabilities."""
-        failed = []
-        for name, client in self.client_manager.clients.items():
+        """Initialize all remote clients concurrently and store their capabilities.
+
+        Each client's MCP handshake (initialize + list_tools/prompts/resources)
+        runs in parallel so startup latency is bounded by the slowest server,
+        not the sum of all servers. Failures are isolated per client.
+        """
+        async def _init_one(name: str, client: ClientSession) -> Optional[str]:
             try:
                 await self.initialize_single_client(name, client)
+                return None
             except Exception as e:
                 self.logger.error(f"❌ Failed to initialize client {name}: {e}")
-                failed.append(name)
+                return name
+
+        results = await asyncio.gather(
+            *(
+                _init_one(name, client)
+                for name, client in list(self.client_manager.clients.items())
+            )
+        )
         # Remove failed clients so their broken sessions don't crash tool listing
-        for name in failed:
-            self.client_manager.clients.pop(name, None)
-            self.client_manager.server_stacks.pop(name, None)
+        for name in results:
+            if name is not None:
+                self.client_manager.clients.pop(name, None)
+                self.client_manager.server_stacks.pop(name, None)
 
     async def initialize_single_client(self, name: str, client: ClientSession) -> None:
         """Initialize a specific client and map its capabilities."""
@@ -584,9 +598,17 @@ class MCPProxyServer(server.Server):
                     f"✅ Calling tool '{tool_name}' on its associated server"
                 )
                 _, original_name = self._split_key(tool_name)
-                result = await tool_item.client.call_tool(
-                    original_name, arguments
-                )
+                timeout_s = self._get_tool_call_timeout(tool_item.server_name)
+                if timeout_s is not None:
+                    result = await tool_item.client.call_tool(
+                        original_name,
+                        arguments,
+                        read_timeout_seconds=timedelta(seconds=timeout_s),
+                    )
+                else:
+                    result = await tool_item.client.call_tool(
+                        original_name, arguments
+                    )
 
                 # Log successful tool invocation (use original name for cross-referencing)
                 self.audit_logger.log_tool_call(
@@ -850,6 +872,26 @@ class MCPProxyServer(server.Server):
             tool_list.append(namespaced_tool)
 
         return tool_list
+
+    def _get_tool_call_timeout(self, server_name: str) -> Optional[float]:
+        """Resolve the configured tool-call timeout (seconds) for a server.
+
+        Reads ``tool_call_timeout_seconds`` from the client manager's stored
+        server config. Returns None (wait indefinitely — previous behavior)
+        when unset, unconfigured, or invalid.
+        """
+        if not self.client_manager:
+            return None
+        configs = getattr(self.client_manager, "server_configs", None)
+        if not isinstance(configs, dict):
+            return None
+        server_cfg = configs.get(server_name)
+        if not isinstance(server_cfg, dict):
+            return None
+        timeout = server_cfg.get("tool_call_timeout_seconds")
+        if isinstance(timeout, (int, float)) and timeout > 0:
+            return float(timeout)
+        return None
 
     @staticmethod
     def _is_tool_allowed(tool_name: str, filter_config: Optional[dict]) -> bool:

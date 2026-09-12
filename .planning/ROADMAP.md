@@ -266,7 +266,7 @@ Plans:
 **Depends on:** Phase 8 (pipeline must produce correct results before enabling)
 
 Plans:
-- [ ] 09-01-PLAN.md — YAML retrieval config + config-driven pipeline init + Recall@15 + describe_rate gate fix + ALERT_RESCORE_RATE
+- [x] 09-01-PLAN.md — YAML retrieval config + config-driven pipeline init + Recall@15 + describe_rate gate fix + ALERT_RESCORE_RATE
 
 **Updated files:**
 - `src/multimcp/yaml_config.py` — expose retrieval config fields (F-06, F-09)

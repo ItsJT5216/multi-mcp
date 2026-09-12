@@ -10,7 +10,7 @@ class TestRetrievalSettings:
     def test_defaults_disabled(self):
         settings = RetrievalSettings()
         assert settings.enabled is False
-        assert settings.top_k == 10
+        assert settings.top_k == 15  # Phase 9: top_k default corrected from 10 to 15 (source plan line 496)
         assert settings.full_description_count == 3
         assert settings.anchor_tools == []
 
