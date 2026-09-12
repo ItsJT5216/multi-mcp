@@ -248,3 +248,4 @@ jobs:
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "✅ No vulnerable dependencies found or fixes needed" >> $GITHUB_STEP_SUMMARY
           fi
+
