@@ -41,9 +41,10 @@ class MCPConfigAdapter(ABC):
     def _backup(self, path: Path) -> None:
         """Create a ``.bak`` copy of *path* before it is overwritten.
 
-        The backup is placed in ``self.backup_dir`` when set, otherwise in the
-        same directory as *path*.  The method is a no-op when *path* does not
-        exist (nothing to back up).
+        The backup is placed in ``self.backup_dir`` when set (with a
+        ``{tool_name}_`` prefix to avoid collisions between tools that share a
+        config filename), otherwise in the same directory as *path*.  The
+        method is a no-op when *path* does not exist (nothing to back up).
         """
         if not path.exists():
             return

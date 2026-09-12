@@ -22,7 +22,7 @@ markdown-it-py==4.2.0
 mcp==1.28.0
 mdurl==0.1.2
 packaging==26.2
-pydantic-core==2.47.0
+pydantic-core==2.46.4
 pydantic-settings==2.14.2
 pydantic==2.13.4
 pygments==2.20.0
