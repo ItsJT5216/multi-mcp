@@ -19,7 +19,7 @@ langchain-mcp-adapters==0.3.0
 langsmith==0.8.18
 loguru==0.7.3
 markdown-it-py==4.2.0
-mcp==1.28.0
+mcp==1.28.1
 mdurl==0.1.2
 packaging==26.2
 pydantic-core==2.46.4
