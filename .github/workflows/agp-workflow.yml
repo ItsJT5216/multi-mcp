@@ -64,7 +64,7 @@ on:
 permissions:
   contents: write
   pull-requests: write
-  id-token: write  # Required for Sonatype Guide OIDC authentication
+  id-token: write # Required for Sonatype Guide OIDC authentication
 
 concurrency:
   group: agp-workflow-${{ github.run_id }}
