@@ -106,6 +106,7 @@ jobs:
       - name: Run AGP
         uses: sonatype/agp-action@v1
         with:
+          create-pr: true
           # Forward the dispatch inputs so a backend-triggered run targets the right mode.
           # A full/scheduled run sends mode=full; security-fix sends mode=security
           # with a vulnerabilities payload; heal sends mode=heal with repo_id; and
