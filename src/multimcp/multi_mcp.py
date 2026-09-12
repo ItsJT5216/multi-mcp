@@ -178,10 +178,17 @@ class MultiMCP:
 
         # Bare format: every top-level key is a server name (Claude plugins)
         if all(isinstance(v, dict) for v in data.values()) and data:
-            # Verify at least one entry looks like a server config
+            # Only entries that look like server configs are servers; this
+            # excludes sibling settings blocks (e.g. top-level "retrieval")
+            # from being misparsed as servers.
             server_keys = {"command", "args", "url", "type"}
-            if any(server_keys & set(v.keys()) for v in data.values()):
-                return MultiMCP._normalize_server_entries(data)
+            bare_servers = {
+                name: entry
+                for name, entry in data.items()
+                if server_keys & set(entry.keys())
+            }
+            if bare_servers:
+                return MultiMCP._normalize_server_entries(bare_servers)
         return {}
 
     @staticmethod
