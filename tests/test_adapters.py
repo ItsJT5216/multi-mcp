@@ -749,6 +749,7 @@ class TestOpenCodeAdapter:
             servers = adapter.discover_servers()
         assert "existing" in servers
         assert "new" in servers
+        assert servers["existing"] == existing["mcp"]["existing"]
 
     def test_discover_no_mcp_key_returns_empty(self, tmp_path: Path) -> None:
         data = {"other_key": "value"}
@@ -760,6 +761,181 @@ class TestOpenCodeAdapter:
     def test_supported_on_all_platforms(self) -> None:
         adapter = self._adapter()
         assert set(adapter.supported_platforms) == {"macos", "linux", "windows"}
+
+
+    @pytest.mark.parametrize("filename", ["config.json", "config.jsonc"])
+    @pytest.mark.parametrize(
+        ("content", "expected"),
+        [
+            pytest.param(
+                '{"mcp": {"existing": {"type": "remote", "url": "http://example.c'
+                'om", "headers": {"X-Literal": "Use /* block */ and // literally"'
+                ', "X-Quote": "quote \\" then // literal", "X-Backslash": "backsla'
+                'sh \\\\ then /* literal */", "X-Commas": ",} ]"}}}, "other": {"uni'
+                'code": "\\u96ea \\ud83d\\ude04", "arr": [1, true, null]}}',
+                {'mcp': {'existing': {'type': 'remote',
+                                      'url': 'http://example.com',
+                                      'headers': {'X-Literal': 'Use /* block */ and // '
+                                                               'literally',
+                                                  'X-Quote': 'quote " then // literal',
+                                                  'X-Backslash': 'backslash \\ then /* '
+                                                                 'literal */',
+                                                  'X-Commas': ',} ]'}}},
+                 'other': {'unicode': '雪 😄', 'arr': [1, True, None]}},
+                id='strict-json-existing-urls',
+            ),
+            pytest.param(
+                '{"escapes": ["\\"//", "\\\\//", "\\\\\\"/* */", "\\\\\\\\\\"//", ",} ,]"]}',
+                {'escapes': ['"//', '\\//', '\\"/* */', '\\\\"//', ',} ,]']},
+                id='strict-json-escaped-strings',
+            ),
+            pytest.param(
+                '/* header " \\ */ {"mcp": {"existing": {"type": "remote", "url": '
+                '"http://example.com", "headers": {"X-Literal": "Use /* block */ '
+                'and // literally", "X-Quote": "quote \\" then // literal", "X-Bac'
+                'kslash": "backslash \\\\ then /* literal */", "X-Commas": ",} ]"}}'
+                '}, "other": {"unicode": "\\u96ea \\ud83d\\ude04", "arr": [1, true, '
+                'null]}} // EOF',
+                {'mcp': {'existing': {'type': 'remote',
+                                      'url': 'http://example.com',
+                                      'headers': {'X-Literal': 'Use /* block */ and // '
+                                                               'literally',
+                                                  'X-Quote': 'quote " then // literal',
+                                                  'X-Backslash': 'backslash \\ then /* '
+                                                                 'literal */',
+                                                  'X-Commas': ',} ]'}}},
+                 'other': {'unicode': '雪 😄', 'arr': [1, True, None]}},
+                id='line-block-comments',
+            ),
+            pytest.param(
+                '{"mcp":{"existing":{"type":"remote","url":"http://example.com",}'
+                ',},"arr":[1,2,],}',
+                {'mcp': {'existing': {'type': 'remote', 'url': 'http://example.com'}},
+                 'arr': [1, 2]},
+                id='nested-trailing-commas',
+            ),
+            pytest.param(
+                '{"x": [1, /* comment */], // comment\n}',
+                {'x': [1]},
+                id='comment-after-trailing-comma',
+            ),
+            pytest.param(
+                '{"x":",} ,] /* keep */ // keep",}',
+                {'x': ',} ,] /* keep */ // keep'},
+                id='comma-and-comment-markers-in-string',
+            ),
+            pytest.param(
+                '{ /* start */ "x" /* key */ : /* value */ [1, /* inner */ 2] /* after */ }',
+                {'x': [1, 2]},
+                id='comments-between-tokens',
+            ),
+            pytest.param('{// comment\r\n"x":1,\r\n}', {'x': 1}, id='crlf-comment-ending'),
+            pytest.param('{// comment\r"x":1,}', {'x': 1}, id='lone-cr-comment-ending'),
+            pytest.param('{}', {}, id='empty-object'),
+            pytest.param('{"x":1,"x":2}', {'x': 2}, id='duplicate-object-key'),
+            pytest.param('{"x":"\\ud83d\\ude04"}', {'x': '😄'}, id='unicode-surrogate-pair'),
+            pytest.param('{"x":"\\ud800"}', {'x': '\ud800'}, id='lone-surrogate-json'),
+            pytest.param(
+                '{"x":"\\ud800", /* comment */}',
+                {'x': '\ud800'},
+                id='lone-surrogate-jsonc',
+            ),
+        ],
+    )
+    def test_read_jsonc_preserves_supported_values(
+        self, tmp_path: Path, filename: str, content: str, expected: dict
+    ) -> None:
+        from src.multimcp.adapters.tools.opencode import OpenCodeAdapter
+
+        path = tmp_path / filename
+        path.write_bytes(content.encode("utf-8"))
+        adapter = OpenCodeAdapter()
+        with patch.object(adapter, "config_path", return_value=path):
+            assert adapter.read_config() == expected
+
+    @pytest.mark.parametrize("filename", ["config.json", "config.jsonc"])
+    @pytest.mark.parametrize(
+        "content",
+        [
+            pytest.param('{"x":1} /* unterminated', id='unterminated-block-comment'),
+            pytest.param('{"x": [1/*comment*/2]}', id='comment-token-concatenation'),
+            pytest.param('{"x":[1,,]}', id='double-array-comma'),
+            pytest.param('{"x":[,1]}', id='leading-array-comma'),
+            pytest.param('{"x":[1 2]}', id='missing-array-comma'),
+            pytest.param('{"x" 1}', id='missing-object-colon'),
+            pytest.param('{"x":}', id='missing-object-value'),
+            pytest.param('{} {}', id='multiple-roots'),
+            pytest.param('{"x":"unterminated}', id='unterminated-string'),
+            pytest.param('{"x":"first\nsecond"}', id='newline-in-string'),
+            pytest.param('{"x":"\\x41"}', id='invalid-string-escape'),
+            pytest.param("{'x':1}", id='single-quoted-json5'),
+            pytest.param('{x:1}', id='unquoted-key-json5'),
+            pytest.param('{"x":0x10}', id='hex-number-json5'),
+            pytest.param('{"x":NaN}', id='NaN-json5'),
+            pytest.param('{"x":Infinity}', id='Infinity-json5'),
+            pytest.param('// comment', id='comment-only'),
+            pytest.param('{} trailing', id='trailing-uncommented-text'),
+        ],
+    )
+    def test_read_jsonc_rejects_invalid_content(
+        self, tmp_path: Path, filename: str, content: str
+    ) -> None:
+        from src.multimcp.adapters.tools.opencode import OpenCodeAdapter
+
+        path = tmp_path / filename
+        path.write_bytes(content.encode("utf-8"))
+        adapter = OpenCodeAdapter()
+        with patch.object(adapter, "config_path", return_value=path):
+            with pytest.raises(json.JSONDecodeError):
+                adapter.read_config()
+
+    @pytest.mark.parametrize("filename", ["config.json", "config.jsonc"])
+    def test_register_jsonc_preserves_config_and_backup(
+        self, tmp_path: Path, filename: str
+    ) -> None:
+        from src.multimcp.adapters.tools.opencode import OpenCodeAdapter
+
+        content = '{"mcp":{"existing":{"type":"remote","url":"http://example.com",},},"arr":[1,2,],}'
+        expected = {'mcp': {'existing': {'type': 'remote', 'url': 'http://example.com'}}, 'arr': [1, 2]}
+        path = tmp_path / filename
+        original_bytes = content.encode("utf-8")
+        path.write_bytes(original_bytes)
+        new_server = {"type": "local", "command": ["python", "main.py"], "enabled": True}
+        adapter = OpenCodeAdapter()
+        with patch.object(adapter, "config_path", return_value=path):
+            adapter.register_server("new", new_server)
+            assert adapter.discover_servers()["existing"] == expected["mcp"]["existing"]
+        expected["mcp"]["new"] = new_server
+        assert json.loads(path.read_text(encoding="utf-8")) == expected
+        assert path.with_name(path.name + ".bak").read_bytes() == original_bytes
+
+    @pytest.mark.parametrize("filename", ["config.json", "config.jsonc"])
+    @pytest.mark.parametrize(
+        "content",
+        [
+            pytest.param('{"x":1} /* unterminated', id='unterminated-block-comment'),
+            pytest.param('{"x": [1/*comment*/2]}', id='comment-token-concatenation'),
+            pytest.param('{"x":[1,,]}', id='double-array-comma'),
+            pytest.param('{"x":"\\x41"}', id='invalid-string-escape'),
+        ],
+    )
+    def test_register_invalid_jsonc_preserves_file_and_backup(
+        self, tmp_path: Path, filename: str, content: str
+    ) -> None:
+        from src.multimcp.adapters.tools.opencode import OpenCodeAdapter
+
+        path = tmp_path / filename
+        original_bytes = content.encode("utf-8")
+        path.write_bytes(original_bytes)
+        backup = path.with_name(path.name + ".bak")
+        previous_backup = b"previous backup remains intact\n"
+        backup.write_bytes(previous_backup)
+        adapter = OpenCodeAdapter()
+        with patch.object(adapter, "config_path", return_value=path):
+            with pytest.raises(json.JSONDecodeError):
+                adapter.register_server("new", {"type": "local", "command": ["python"]})
+        assert path.read_bytes() == original_bytes
+        assert backup.read_bytes() == previous_backup
 
 
 # ---------------------------------------------------------------------------
@@ -1002,6 +1178,8 @@ class TestBackupMechanism:
         adapter._backup(p)
         bak = bak_dir / "claude_desktop_settings.json.bak"
         assert bak.exists()
+        assert bak.read_text(encoding="utf-8") == '{"data": 1}'
+        assert p.read_text(encoding="utf-8") == '{"data": 1}'
         assert not (src_dir / "settings.json.bak").exists()
 
     def test_backup_noop_when_file_missing(self, tmp_path: Path) -> None:

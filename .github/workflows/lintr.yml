@@ -41,14 +41,30 @@ jobs:
       - name: Setup lintr
         uses: r-lib/actions/setup-r-dependencies@d3c5be51b12e724e68f33216ca3c148b66d5f0b6
         with:
-          extra-packages: lintr
+          extra-packages: |
+            any::lintr
+            any::jsonlite
 
       - name: Run lintr
-        run: lintr::sarif_output(lintr::lint_dir("."), "lintr-results.sarif")
+        id: lintr
+        run: |
+          # Match the documented lint_dir() formats for discovery and scanning.
+          source_pattern <- "(?i)[.](r|rmd|qmd|rnw|rhtml|rrst|rtex|rtxt)$"
+          source_files <- list.files(".", pattern = source_pattern, recursive = TRUE, full.names = TRUE)
+          lints <- lintr::lint_dir(".", pattern = source_pattern)
+          if (length(source_files) == 0L) {
+            message("not applicable: no recognized R source files")
+            cat("not applicable: no recognized R source files\n",
+                file = Sys.getenv("GITHUB_STEP_SUMMARY"), append = TRUE)
+            cat("applicable=false\n", file = Sys.getenv("GITHUB_OUTPUT"), append = TRUE)
+          } else {
+            lintr::sarif_output(lints, filename = "lintr-results.sarif")
+            cat("applicable=true\n", file = Sys.getenv("GITHUB_OUTPUT"), append = TRUE)
+          }
         shell: Rscript {0}
-        continue-on-error: true
 
       - name: Upload analysis results to GitHub
+        if: steps.lintr.outputs.applicable == 'true'
         uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: lintr-results.sarif

@@ -253,10 +253,10 @@ Authenticate with `Authorization: Bearer <key>` (set `MULTI_MCP_API_KEY` env var
 
 ```bash
 # Run tests
-uv run python -m pytest
+uv run --extra test python -m pytest
 
 # Run specific test file
-uv run python -m pytest tests/test_cache_manager.py -v
+uv run --extra test python -m pytest tests/test_cache_manager.py -v
 
 # Check what's configured
 uv run python main.py status

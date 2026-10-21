@@ -9,7 +9,12 @@ from __future__ import annotations
 import time
 from typing import TYPE_CHECKING, Optional
 
-from loguru import logger
+try:
+    from loguru import logger
+except ImportError:  # pragma: no cover - dependency-light fallback
+    import logging
+
+    logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from .scanner import TelemetryScanner
@@ -40,8 +45,10 @@ class RootMonitor:
         scanner: Optional["TelemetryScanner"] = None,
         significance_threshold: float = _SIGNIFICANCE_THRESHOLD,
         min_debounce_s: float = 10.0,
+        root_uris: Optional[list[str]] = None,
     ) -> None:
         self._scanner = scanner
+        self._root_uris: list[str] = list(root_uris or [])
         self._threshold = significance_threshold
         self._min_debounce_s = min_debounce_s
 
@@ -60,11 +67,23 @@ class RootMonitor:
         """Return True if enough time has passed since last poll."""
         return (time.monotonic() - self._last_poll_time) >= self.poll_interval
 
-    def poll(self) -> float:
+    @property
+    def root_uris(self) -> list[str]:
+        """Configured root URIs that poll() will scan."""
+        return list(self._root_uris)
+
+    def set_root_uris(self, root_uris: list[str]) -> None:
+        """Replace the configured root URIs used by poll()."""
+        self._root_uris = list(root_uris)
+
+    def poll(self, root_uris: Optional[list[str]] = None) -> float:
         """Scan roots and return detected change significance (0.0-1.0).
 
         Backs off polling interval if no significant change found.
         Resets interval after significant change.
+
+        Args:
+            root_uris: Optional override for the roots to scan on this poll.
         """
         self._last_poll_time = time.monotonic()
 
@@ -72,12 +91,17 @@ class RootMonitor:
             # No scanner: accumulate nothing, back off on idle
             significance = 0.0
         else:
-            try:
-                evidence = self._scanner.scan_roots()
-                significance = self._estimate_significance(evidence)
-            except Exception as exc:
-                logger.warning("Scanner failed during poll: {}", str(exc))
+            active_root_uris = list(root_uris) if root_uris is not None else self._root_uris
+            if not active_root_uris:
+                logger.warning("RootMonitor.poll() skipped: no root URIs configured")
                 significance = 0.0
+            else:
+                try:
+                    evidence = self._scanner.scan_roots(active_root_uris)
+                    significance = self._estimate_significance(evidence)
+                except Exception as exc:
+                    logger.warning(f"Scanner failed during poll: {exc}")
+                    significance = 0.0
 
         self.record_change(significance)
 

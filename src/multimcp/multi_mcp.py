@@ -492,6 +492,8 @@ class MultiMCP:
                 client = await self.client_manager.get_or_create_client(server_name)
                 if self.proxy:
                     await self.proxy.initialize_single_client(server_name, client)
+                    if self.proxy.retrieval_pipeline is not None:
+                        self.proxy.retrieval_pipeline.rebuild_catalog(self.proxy.tool_to_server)
                     await self.proxy._send_tools_list_changed()
                     self.logger.info(f"✅ Always-on server '{server_name}' connected")
             except Exception as e:
@@ -578,9 +580,6 @@ class MultiMCP:
             if srv.always_on
         }
         self._track_task(self.client_manager.start_always_on_watchdog(always_on_configs), "always-on-watchdog")
-
-        # Background: connect always_on servers after proxy starts (concurrently —
-        # bounded by the client manager's connection semaphore, failures isolated)
 
         try:
             self.proxy = await MCPProxyServer.create(self.client_manager)
@@ -693,6 +692,8 @@ class MultiMCP:
                 """Called by watchdog after reconnect — refresh proxy tool mappings."""
                 try:
                     await self.proxy.initialize_single_client(server_name, client)
+                    if self.proxy.retrieval_pipeline is not None:
+                        self.proxy.retrieval_pipeline.rebuild_catalog(self.proxy.tool_to_server)
                     await self.proxy._send_tools_list_changed()
                     self.logger.info(f"✅ Proxy updated after watchdog reconnect of '{server_name}'")
                 except Exception as e:

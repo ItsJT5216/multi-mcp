@@ -1,0 +1,56 @@
+name: Git-Print CI Status
+# git-print:ci-status
+#
+# Auto-installed by `git-print install`. When a watched CI workflow FAILS on a
+# pull request, this builds a CI-failure report (status, failure annotations +
+# extracted job logs, changed files, commits) and uploads it as the
+# "Git-Print-CI-Status" artifact.
+#
+#   * EDIT workflows: below to match the name: of YOUR CI workflow(s). Default "CI".
+#   * This file must exist on the repo's DEFAULT branch to take effect.
+#   * workflow_run is the only trigger that can observe GitHub-Actions CI failures.
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+
+permissions:
+  contents: read
+  pull-requests: read
+  checks: read
+  actions: read
+
+jobs:
+  report:
+    if: ${{ github.event.workflow_run.conclusion == 'failure' && github.event.workflow_run.event == 'pull_request' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install git-print
+        run: npm install -g github:itstanner5216/Git-Print
+
+      - name: Resolve PR number
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PR=$(jq -r '.[0].number // empty' <<< '${{ toJSON(github.event.workflow_run.pull_requests) }}')
+          if [ -z "$PR" ]; then
+            PR=$(gh api "repos/${{ github.repository }}/commits/${{ github.event.workflow_run.head_sha }}/pulls" --jq '.[0].number // empty' 2>/dev/null || true)
+          fi
+          echo "number=$PR" >> "$GITHUB_OUTPUT"
+          if [ -n "$PR" ]; then echo "Resolved PR #$PR"; else echo "No PR for this run — nothing to report."; fi
+
+      - name: Generate CI failure report
+        if: steps.pr.outputs.number != ''
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          git-print ci-status --pr "${{ steps.pr.outputs.number }}" --sha "${{ github.event.workflow_run.head_sha }}" --out Git-Print-CI-Status.md
+
+      - name: Upload report artifact
+        if: steps.pr.outputs.number != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: Git-Print-CI-Status
+          path: Git-Print-CI-Status.md

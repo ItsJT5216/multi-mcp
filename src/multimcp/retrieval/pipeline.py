@@ -720,7 +720,14 @@ class RetrievalPipeline:
 
         # Step 10: Post-boundary state sync — single authoritative pass from SSM
         post_boundary_active = self.session_manager.get_active_tools(session_id)
-        state.active_tool_ids = list(post_boundary_active)
+        # Sort by current score before storing so any budget-limited slice is stable.
+        state.active_tool_ids = sorted(
+            post_boundary_active,
+            key=lambda tool_key: (
+                -score_by_key.get(tool_key, float("-inf")),
+                tool_key,
+            ),
+        )
         state.router_enum_tool_ids = [k for k in all_registry_keys if k not in post_boundary_active]
 
         # Step 11: Write remaining scoring signals to state
@@ -903,4 +910,3 @@ class RetrievalPipeline:
         self._in_turn.pop(session_id, None)
         self._turn_snapshot_version.pop(session_id, None)
         self.session_manager.cleanup_session(session_id)
-

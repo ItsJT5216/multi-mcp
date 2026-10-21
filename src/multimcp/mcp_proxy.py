@@ -148,6 +148,9 @@ class MCPProxyServer(server.Server):
                     tool=cached_tool,
                 )
 
+        if self.retrieval_pipeline is not None:
+            self.retrieval_pipeline.rebuild_catalog(self.tool_to_server)
+
     async def initialize_remote_clients(self) -> None:
         """Initialize all remote clients concurrently and store their capabilities.
 
@@ -382,6 +385,8 @@ class MCPProxyServer(server.Server):
                 )
 
         await self._send_tools_list_changed()
+        if self.retrieval_pipeline is not None:
+            self.retrieval_pipeline.rebuild_catalog(self.tool_to_server)
         visible = sum(1 for m in self.tool_to_server.values()
                       if m.server_name == server_name and m.client is not None)
         return {
@@ -557,16 +562,21 @@ class MCPProxyServer(server.Server):
         enabled_servers = await self.trigger_manager.check_and_enable(message)
 
         # If servers were enabled, register them with the proxy
+        refresh_needed = False
         for server_name in enabled_servers:
             client = self.client_manager.clients.get(server_name)
             if client:
                 try:
                     await self.initialize_single_client(server_name, client)
+                    refresh_needed = True
                     self.logger.info(f"🔥 Auto-enabled server '{server_name}' via trigger")
                 except Exception as e:
                     self.logger.warning(
                         f"⚠️ Trigger-enabled '{server_name}' failed to initialize: {e}"
                     )
+
+        if refresh_needed and self.retrieval_pipeline is not None:
+            self.retrieval_pipeline.rebuild_catalog(self.tool_to_server)
 
         # Re-check tool_to_server in case new tool was just enabled
         if not tool_item:

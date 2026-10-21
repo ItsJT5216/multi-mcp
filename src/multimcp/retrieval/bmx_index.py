@@ -141,15 +141,26 @@ class BMXIndex:
 
     def __post_init__(self):
         """Initialize mutable default fields."""
+        self._reset_index_state()
+
+    def _reset_index_state(self) -> None:
+        """Reset all corpus-derived state."""
         self._documents = {}
         self._doc_lengths = {}
         self._doc_freqs = {}
         self._idf_cache = {}
+        self._total_docs = 0
+        self._avg_doc_length = 0.0
+        self._alpha = 1.0
+        self._beta = 0.01
+        self._is_built = False
         self._term_entropy = {}
         self._term_total_freqs = {}
         self._posting_list_tfs = {}
         self._inverted_index = {}
         self._dirty_terms = set()
+        self._field_indexes = {}
+        self._field_weights = {}
 
     # ─── Tokenization ────────────────────────────────────────────────
 
@@ -314,20 +325,14 @@ class BMXIndex:
         Raises:
             ValueError: If chunks is empty or missing required keys.
         """
+        # Reset before validation so empty or invalid rebuilds cannot retain
+        # stale postings, cached scores, or field subindexes.
+        self._reset_index_state()
+
         if not chunks:
             logger.warning("Building BMX index with empty chunk list")
             self._is_built = True
             return
-
-        # Reset all state
-        self._documents.clear()
-        self._doc_lengths.clear()
-        self._doc_freqs.clear()
-        self._idf_cache.clear()
-        self._term_entropy.clear()
-        self._term_total_freqs.clear()
-        self._posting_list_tfs.clear()
-        self._inverted_index.clear()
 
         total_length = 0
 
@@ -713,20 +718,7 @@ class BMXIndex:
 
     def clear(self) -> None:
         """Clear the entire index."""
-        self._documents.clear()
-        self._doc_lengths.clear()
-        self._doc_freqs.clear()
-        self._idf_cache.clear()
-        self._term_entropy.clear()
-        self._term_total_freqs.clear()
-        self._posting_list_tfs.clear()
-        self._inverted_index.clear()
-        self._dirty_terms.clear()
-        self._total_docs = 0
-        self._avg_doc_length = 0.0
-        self._alpha = 1.0
-        self._beta = 0.01
-        self._is_built = False
+        self._reset_index_state()
         logger.info("BMX index cleared")
 
     # ─── BMXF field-weighted wrapper ─────────────────────────────

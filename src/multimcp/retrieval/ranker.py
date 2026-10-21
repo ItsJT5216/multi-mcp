@@ -34,15 +34,25 @@ class RelevanceRanker:
         if not tools:
             return []
 
-        return sorted(
-            tools,
-            key=lambda t: (
-                # Bucket scores into tolerance bands for tiebreaking
-                round(t.score / _SCORE_TOLERANCE) * _SCORE_TOLERANCE,
-                # Within a band, more specific tools rank first
-                _get_specificity(t),
-                # Final tiebreak: tool_key for determinism
-                t.tool_key,
-            ),
-            reverse=True,
+        by_score = sorted(tools, key=lambda t: (-t.score, t.tool_key))
+        ranked: list[ScoredTool] = []
+        tied_group: list[ScoredTool] = []
+        group_score: float | None = None
+
+        for tool in by_score:
+            if group_score is None or abs(group_score - tool.score) < _SCORE_TOLERANCE:
+                tied_group.append(tool)
+                if group_score is None:
+                    group_score = tool.score
+                continue
+
+            ranked.extend(
+                sorted(tied_group, key=lambda t: (-_get_specificity(t), t.tool_key))
+            )
+            tied_group = [tool]
+            group_score = tool.score
+
+        ranked.extend(
+            sorted(tied_group, key=lambda t: (-_get_specificity(t), t.tool_key))
         )
+        return ranked

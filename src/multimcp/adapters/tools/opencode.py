@@ -48,98 +48,70 @@ class OpenCodeAdapter(MCPConfigAdapter):
         return self._user_config_path()
 
     def _strip_jsonc_comments(self, content: str) -> str:
-        """Strip comments and trailing commas from JSONC content.
-
-        The scan is string-aware: ``//`` and ``/* */`` sequences inside JSON
-        string literals (e.g. ``"http://example.com"``) are preserved.
-        """
-        result: list[str] = []
-        i = 0
-        n = len(content)
-        in_string = False
-        while i < n:
-            ch = content[i]
-            if in_string:
-                result.append(ch)
-                if ch == "\\" and i + 1 < n:
-                    result.append(content[i + 1])
-                    i += 2
-                    continue
-                if ch == '"':
-                    in_string = False
-                i += 1
+        """Replace comments and trailing commas with whitespace, preserving strings."""
+        result = list(content)
+        commas = []
+        index = 0
+        length = len(content)
+        while index < length:
+            character = content[index]
+            if character == '"':
+                index += 1
+                while index < length:
+                    if content[index] == '\\':
+                        index += 2
+                    elif content[index] == '"':
+                        index += 1
+                        break
+                    else:
+                        index += 1
                 continue
-            if ch == '"':
-                in_string = True
-                result.append(ch)
-                i += 1
+            if content.startswith('//', index):
+                end = index + 2
+                while end < length and content[end] not in '\r\n':
+                    end += 1
+                result[index:end] = ' ' * (end - index)
+                index = end
                 continue
-            if ch == "/" and i + 1 < n:
-                nxt = content[i + 1]
-                if nxt == "/":
-                    # Single-line comment: skip to end of line (keep the newline).
-                    while i < n and content[i] != "\n":
-                        i += 1
-                    continue
-                if nxt == "*":
-                    # Multi-line comment: skip past the closing */.
-                    i += 2
-                    while i + 1 < n and not (content[i] == "*" and content[i + 1] == "/"):
-                        i += 1
-                    i += 2
-                    continue
-            result.append(ch)
-            i += 1
-        stripped = "".join(result)
-        # Remove trailing commas before closing braces/brackets, again string-aware.
-        result = []
-        in_string = False
-        i = 0
-        n = len(stripped)
-        while i < n:
-            ch = stripped[i]
-            if in_string:
-                result.append(ch)
-                if ch == "\\" and i + 1 < n:
-                    result.append(stripped[i + 1])
-                    i += 2
-                    continue
-                if ch == '"':
-                    in_string = False
-                i += 1
+            if content.startswith('/*', index):
+                end = content.find('*/', index + 2)
+                if end == -1:
+                    raise json.JSONDecodeError('Unterminated block comment', content, index)
+                end += 2
+                for position in range(index, end):
+                    if result[position] not in '\r\n':
+                        result[position] = ' '
+                index = end
                 continue
-            if ch == '"':
-                in_string = True
-                result.append(ch)
-                i += 1
-                continue
-            if ch == ",":
-                j = i + 1
-                while j < n and stripped[j].isspace():
-                    j += 1
-                if j < n and stripped[j] in "}]":
-                    i += 1  # drop the trailing comma
-                    continue
-            result.append(ch)
-            i += 1
-        return "".join(result)
+            if content.startswith(('NaN', 'Infinity', '-Infinity'), index):
+                raise json.JSONDecodeError('Invalid JSON constant', content, index)
+            if character == ',':
+                commas.append(index)
+            index += 1
+        for index in commas:
+            following = index + 1
+            while following < length and result[following] in ' \t\r\n':
+                following += 1
+            preceding = index - 1
+            while preceding >= 0 and result[preceding] in ' \t\r\n':
+                preceding -= 1
+            if (following < length and result[following] in '}]'
+                    and preceding >= 0 and result[preceding] not in ',[{:'):
+                result[index] = ' '
+        return ''.join(result)
 
     def read_config(self) -> Dict:
         """Read OpenCode's config, returning {} if absent.
 
-        Supports both JSON and JSONC formats. Plain JSON is parsed as-is;
-        comment/trailing-comma stripping is applied only when the initial
-        parse fails, so ``//`` sequences inside string values (e.g. URLs)
-        never corrupt valid JSON.
+        Supports JSONC comments and trailing commas without changing string
+        literals. Invalid content raises JSONDecodeError before any write.
         """
         path = self.config_path()
         if path is None or not path.exists():
             return {}
         content = path.read_text(encoding="utf-8")
-        try:
-            return json.loads(content)
-        except json.JSONDecodeError:
-            return json.loads(self._strip_jsonc_comments(content))
+        content = self._strip_jsonc_comments(content)
+        return json.loads(content)
 
     def write_config(self, data: Dict) -> None:
         """Write *data* to OpenCode's config file."""

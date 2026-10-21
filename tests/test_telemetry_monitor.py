@@ -5,6 +5,7 @@ Tests: TELEM-05 (adaptive polling, significance threshold, debounce).
 from __future__ import annotations
 
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -149,6 +150,64 @@ def test_poll_updates_last_poll_time():
     m.poll()
     after = time.monotonic()
     assert before <= m._last_poll_time <= after
+
+
+def test_poll_uses_configured_root_uris():
+    """poll() forwards configured root URIs to the scanner."""
+    calls: list[list[str]] = []
+
+    class Scanner:
+        def scan_roots(self, root_uris):
+            calls.append(list(root_uris))
+            return SimpleNamespace(workspace_confidence=0.8)
+
+    m = RootMonitor(scanner=Scanner(), root_uris=["file:///configured"])
+    assert m.root_uris == ["file:///configured"]
+
+    result = m.poll()
+
+    assert result == 0.8
+    assert calls == [["file:///configured"]]
+
+
+def test_poll_accepts_root_override_without_mutating_config():
+    """poll(root_uris=...) uses the override and preserves configured roots."""
+    calls: list[list[str]] = []
+
+    class Scanner:
+        def scan_roots(self, root_uris):
+            calls.append(list(root_uris))
+            return SimpleNamespace(workspace_confidence=0.75)
+
+    m = RootMonitor(scanner=Scanner(), root_uris=["file:///configured"])
+    result = m.poll(root_uris=["file:///override"])
+
+    assert result == 0.75
+    assert calls == [["file:///override"]]
+    assert m.root_uris == ["file:///configured"]
+
+
+def test_poll_without_configured_roots_warns_and_skips_scanner(monkeypatch):
+    """poll() must not silently no-op when no roots are configured."""
+    warnings: list[str] = []
+
+    class Scanner:
+        def scan_roots(self, root_uris):
+            raise AssertionError("scanner should not be called without roots")
+
+    class DummyLogger:
+        def warning(self, message):
+            warnings.append(str(message))
+
+    import src.multimcp.retrieval.telemetry.monitor as monitor_mod
+
+    monkeypatch.setattr(monitor_mod, "logger", DummyLogger())
+
+    m = RootMonitor(scanner=Scanner(), root_uris=[])
+    result = m.poll()
+
+    assert result == 0.0
+    assert warnings and "no root URIs configured" in warnings[0]
 
 
 # ── should_poll() timing ─────────────────────────────────────────────────────

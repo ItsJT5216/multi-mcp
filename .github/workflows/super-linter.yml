@@ -5,6 +5,10 @@ on:
 
 jobs:
   run-lint:
+    permissions:
+      contents: read
+      statuses: write
+      pull-requests: write
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -16,4 +20,6 @@ jobs:
         uses: super-linter/super-linter@v8
         env:
           VALIDATE_ALL_CODEBASE: false
+          MULTI_STATUS: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+          ENABLE_GITHUB_PULL_REQUEST_SUMMARY_COMMENT: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

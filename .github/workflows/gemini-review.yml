@@ -1,0 +1,66 @@
+name: "🔎 Dazbo's Gemini Code Review"
+
+on:
+  pull_request:
+    branches:
+      - main
+  issue_comment:
+    types: [created]
+
+jobs:
+  review:
+    # Run on internal PR updates (same repo), OR on issue comment starting with /gemini-review by repo owners/members
+    if: |
+      (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) ||
+      (
+        github.event_name == 'issue_comment' &&
+        github.event.issue.pull_request &&
+        startsWith(github.event.comment.body, '/gemini-review') &&
+        contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
+      )
+    runs-on: ubuntu-latest
+
+    # Re-reviewing on every push is the point, but a burst of pushes should not mean a burst of
+    # reviews. Each one is a full billed call.
+    #
+    # This MUST sit on the job, not on the workflow. At workflow level the group is evaluated when
+    # the run is QUEUED, before any job `if` is considered, and an `issue_comment` payload has no
+    # top-level `pull_request` — so the key falls through to `github.event.issue.number`, which is
+    # the same number as the PR. Any comment on the PR would therefore land in the same group and
+    # `cancel-in-progress` would kill the review already in flight, before the job could skip
+    # itself. Down here, cancellation only happens once a job is actually going to run.
+    #
+    # Key on the PR number alone. Adding `github.event_name` splits `pull_request` and
+    # `issue_comment` into separate queues, so a `/gemini-review` comment would run alongside an
+    # in-flight push review instead of superseding it. One review per PR at a time, newest wins.
+    concurrency:
+      group: gemini-review-${{ github.event.pull_request.number || github.event.issue.number }}
+      cancel-in-progress: true
+
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      statuses: write
+      checks: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          # Automatically checks out the head ref for PR events,
+          # and pulls the PR head branch for comment-based triggers
+          ref: ${{ github.event.pull_request.head.sha || format('refs/pull/{0}/head', github.event.issue.number) }}
+
+      - name: Dazbo's Gemini Code Review & Issue Triage
+        uses: derailed-dash/gemini-review-action@v1.8.3
+        with:
+          gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          resolve_addressed_threads: 'true'
+          gemini_model: 'gemini-3.8-flash'
+          persona: 'straight'
+          include_comment_history: 'true'
+          timeout: '600'
+          language: 'English (US)'
+          include_comment_history: 'true'
