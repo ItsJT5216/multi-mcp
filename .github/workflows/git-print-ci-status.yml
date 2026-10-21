@@ -50,7 +50,7 @@ jobs:
 
       - name: Upload report artifact
         if: steps.pr.outputs.number != ''
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: Git-Print-CI-Status
           path: Git-Print-CI-Status.md
