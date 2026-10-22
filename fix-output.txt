@@ -1,0 +1,13 @@
+Found 10 known vulnerabilities in 5 packages and fixed 10 vulnerabilities in 5 packages
+Name    Version   ID              Fix Versions Applied Fix
+------- --------- --------------- ------------ -------------------------------------------------------
+anyio   4.14.0    PYSEC-2026-4025 4.14.2       Successfully upgraded anyio (4.14.0 => 4.14.2)
+anyio   4.14.0    PYSEC-2026-4023 4.14.2       Successfully upgraded anyio (4.14.0 => 4.14.2)
+anyio   4.14.0    PYSEC-2026-4024 4.14.2       Successfully upgraded anyio (4.14.0 => 4.14.2)
+certifi 2026.6.17 PYSEC-2026-4320 2026.10.19   Successfully upgraded certifi (2026.6.17 => 2026.10.19)
+mcp     1.28.1    CVE-2026-59951  1.30.0,2.2.0 Successfully upgraded mcp (1.28.1 => 1.30.0)
+pyjwt   2.14.0    PYSEC-2026-4141 2.15.0       Successfully upgraded pyjwt (2.14.0 => 2.15.0)
+pyjwt   2.14.0    PYSEC-2026-4183 2.15.0       Successfully upgraded pyjwt (2.14.0 => 2.15.0)
+urllib3 2.7.0     PYSEC-2026-4177 2.8.0        Successfully upgraded urllib3 (2.7.0 => 2.8.0)
+urllib3 2.7.0     PYSEC-2026-4176 2.8.0        Successfully upgraded urllib3 (2.7.0 => 2.8.0)
+urllib3 2.7.0     PYSEC-2026-4175 2.8.0        Successfully upgraded urllib3 (2.7.0 => 2.8.0)
