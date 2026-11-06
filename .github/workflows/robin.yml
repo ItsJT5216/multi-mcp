@@ -1,0 +1,35 @@
+name: Robin
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  issue_comment:
+    types: [created]
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    uses: antongulin/robin/.github/workflows/review.yml@v2
+    concurrency:
+      group: robin-${{ github.event.pull_request.number || github.event.issue.number }}-${{ github.workflow }}
+      cancel-in-progress: true
+    with:
+      # --- Review coverage ---
+      review-on-synchronize: true 
+      fail-on-high: true            
+      min-command-permission: "write"
+
+      # --- Mercury-3 tuning ---
+      llm-temperature: "0.7"
+      max-output-tokens: "131072"
+      llm-timeout-ms: "1800000"
+      config-file: ".github/robin.yml"
+      runner: '"ubuntu-latest"'
+    secrets:
+      LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+      LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
+      LLM_MODEL: ${{ vars.LLM_MODEL }}

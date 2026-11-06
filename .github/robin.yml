@@ -1,0 +1,23 @@
+# Robin repo config — read from the PR *base* branch.
+# Blank workflow inputs defer here; see .github/workflows/robin.yml.
+
+# --- Review scope ---
+max-diff-size: 250000
+max-comments: 15
+json-response-mode: true
+request-changes: true
+reasoning-effort: high
+agent-mode: auto
+agent-max-turns: 100
+agent-max-diff-size: 250000 
+skip-paths:
+  - "**/generated/**"
+  - "**/vendor/**"
+  - "**/build/**"
+  - "**/coverage/**"
+  - "**/*.min.js"
+  - "**/*.map"
+  - "**/*.snap"
+  
+bot-review-policy: all
+bot-allowlist: []
