@@ -17,7 +17,7 @@ jobs:
           fetch-depth: 0
 
       - name: Lint Code Base
-        uses: super-linter/super-linter@v8
+        uses: super-linter/super-linter@v9
         env:
           VALIDATE_ALL_CODEBASE: false
           MULTI_STATUS: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
