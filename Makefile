@@ -5,7 +5,7 @@ docker-build:
 	docker build -t multi-mcp .
 
 docker-run:
-	docker run -p 8085:8085 multi-mcp
+	docker run --env MULTI_MCP_API_KEY --env MULTI_MCP_MANAGEMENT_API_KEY -p 8085:8085 multi-mcp
 
 # Run
 run:

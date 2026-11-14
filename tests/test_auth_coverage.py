@@ -3,7 +3,8 @@ Extended auth coverage tests.
 
 Covers:
   6b. Auth Coverage:
-  - Every HTTP endpoint requires auth when MULTI_MCP_API_KEY is set
+  - MCP endpoints use MULTI_MCP_API_KEY
+  - Mutating routes require distinct MULTI_MCP_MANAGEMENT_API_KEY auth
   - Auth uses hmac.compare_digest (not == comparison)
   - SSE transport accepts Bearer header OR ?token= query param (deprecated)
   - Invalid / missing tokens get 401
@@ -24,6 +25,7 @@ from src.multimcp.multi_mcp import MultiMCP
 # ─── helpers ────────────────────────────────────────────────────────────────
 
 API_KEY = "test-key-abc123"
+MANAGEMENT_API_KEY = "management-key-def456"
 
 
 def _build_app_with_auth() -> MultiMCP:
@@ -33,6 +35,7 @@ def _build_app_with_auth() -> MultiMCP:
         host="127.0.0.1",
         port=18090,
         api_key=API_KEY,
+        management_api_key=MANAGEMENT_API_KEY,
     )
     # Wire a proxy so endpoint handlers don't fail with AttributeError
     app.proxy = MCPProxyServer(MCPClientManager())
@@ -251,35 +254,57 @@ class TestEndpointAuth:
             )
 
     def test_mcp_control_accepts_valid_bearer(self):
-        """POST /mcp_control with valid Bearer returns non-401."""
+        """POST /mcp_control with the management Bearer returns non-401."""
         app = _build_app_with_auth()
         client = TestClient(app.create_starlette_app(), raise_server_exceptions=False)
         response = client.post(
             "/mcp_control",
-            headers={"Authorization": f"Bearer {API_KEY}"},
+            headers={"Authorization": f"Bearer {MANAGEMENT_API_KEY}"},
             json={"action": "enable", "server": "nonexistent"},
         )
         # Auth passed — the handler may return 404 since 'nonexistent' isn't registered
         assert response.status_code != 401
 
     def test_mcp_servers_post_accepts_valid_bearer(self):
-        """POST /mcp_servers with valid Bearer returns non-401."""
+        """POST /mcp_servers with the management Bearer returns non-401."""
+        app = _build_app_with_auth()
+        client = TestClient(app.create_starlette_app(), raise_server_exceptions=False)
+        response = client.post(
+            "/mcp_servers",
+            headers={"Authorization": f"Bearer {MANAGEMENT_API_KEY}"},
+            json={"mcpServers": {}},
+        )
+        # Auth passed — the handler may return 4xx for invalid payload, but not 401
+        assert response.status_code != 401
+
+    def test_client_bearer_cannot_manage_servers(self):
+        """The client Bearer cannot cross into the operator-only process boundary."""
         app = _build_app_with_auth()
         client = TestClient(app.create_starlette_app(), raise_server_exceptions=False)
         response = client.post(
             "/mcp_servers",
             headers={"Authorization": f"Bearer {API_KEY}"},
-            json={"mcpServers": {}},
+            json={"mcpServers": {"attacker": {"command": "sh"}}},
         )
-        # Auth passed — the handler may return 4xx for invalid payload, but not 401
-        assert response.status_code != 401
+        assert response.status_code == 401
+
+    def test_client_bearer_cannot_control_servers(self):
+        """The client Bearer cannot enable even preconfigured backend processes."""
+        app = _build_app_with_auth()
+        client = TestClient(app.create_starlette_app(), raise_server_exceptions=False)
+        response = client.post(
+            "/mcp_control",
+            headers={"Authorization": f"Bearer {API_KEY}"},
+            json={"action": "enable", "server": "test"},
+        )
+        assert response.status_code == 401
 
 
 # ─── TestAuthDisabled: no auth when key not set ──────────────────────────────
 
 
 class TestAuthDisabled:
-    """When MULTI_MCP_API_KEY is not configured, all endpoints are open."""
+    """Without a client key, read-only endpoints stay open and management stays closed."""
 
     @pytest.fixture
     def no_auth_client(self):
@@ -314,6 +339,14 @@ class TestAuthDisabled:
         """GET /mcp_tools returns non-401 when auth is disabled."""
         response = no_auth_client.get("/mcp_tools")
         assert response.status_code != 401
+
+    def test_management_closed_without_operator_key(self, no_auth_client):
+        """POST /mcp_servers returns 403 instead of accepting unauthenticated commands."""
+        response = no_auth_client.post(
+            "/mcp_servers",
+            json={"mcpServers": {"attacker": {"command": "sh"}}},
+        )
+        assert response.status_code == 403
 
     def test_auth_enabled_property_false_when_no_key(self):
         """auth_enabled is False when no api_key is set."""

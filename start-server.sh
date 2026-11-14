@@ -7,14 +7,17 @@
 # - Port 8085 (production default)
 # - Production configuration (msc/mcp.json)
 # - Lazy loading enabled
-# - API key authentication (if MULTI_MCP_API_KEY set)
+# - API key authentication (required for non-loopback binds)
 #
 # Required environment variables:
 # - GITHUB_PERSONAL_ACCESS_TOKEN (for GitHub MCP server)
 # - BRAVE_API_KEY (for Brave Search MCP server)
 #
+# Required environment variables for the default network bind:
+# - MULTI_MCP_API_KEY (for MCP client authentication)
+#
 # Optional environment variables:
-# - MULTI_MCP_API_KEY (for authentication)
+# - MULTI_MCP_MANAGEMENT_API_KEY (enables mutating management endpoints)
 # - MULTI_MCP_HOST (default: 0.0.0.0)
 # - MULTI_MCP_PORT (default: 8085)
 # - MULTI_MCP_CONFIG (default: msc/mcp.json)
@@ -57,11 +60,18 @@ if ! check_env_var "BRAVE_API_KEY"; then
     all_set=false
 fi
 
-# Check optional API key for authentication
+# Network deployments must fail closed without client authentication.
 if [ -n "$MULTI_MCP_API_KEY" ]; then
     echo -e "${GREEN}✅ MULTI_MCP_API_KEY is set (authentication enabled)${NC}"
 else
-    echo -e "${YELLOW}⚠️  MULTI_MCP_API_KEY is not set (authentication disabled)${NC}"
+    echo -e "${RED}❌ MULTI_MCP_API_KEY is required for network deployments${NC}"
+    all_set=false
+fi
+
+if [ -n "$MULTI_MCP_MANAGEMENT_API_KEY" ]; then
+    echo -e "${GREEN}✅ MULTI_MCP_MANAGEMENT_API_KEY is set (management enabled)${NC}"
+else
+    echo -e "${YELLOW}⚠️  MULTI_MCP_MANAGEMENT_API_KEY is not set (management disabled)${NC}"
 fi
 
 echo ""
@@ -72,7 +82,8 @@ if [ "$all_set" = false ]; then
     echo "Example:"
     echo "  export GITHUB_PERSONAL_ACCESS_TOKEN='your-token-here'"
     echo "  export BRAVE_API_KEY='your-api-key-here'"
-    echo "  export MULTI_MCP_API_KEY='your-secret-key' (optional, for auth)"
+    echo "  export MULTI_MCP_API_KEY='your-client-secret'"
+    echo "  export MULTI_MCP_MANAGEMENT_API_KEY='your-distinct-operator-secret' (optional)"
     echo ""
     exit 1
 fi
