@@ -20,6 +20,10 @@ from src.multimcp.mcp_proxy import MCPProxyServer
 from src.multimcp.mcp_client import MCPClientManager
 
 
+MANAGEMENT_API_KEY = "input-test-management-key"
+MANAGEMENT_HEADERS = {"Authorization": f"Bearer {MANAGEMENT_API_KEY}"}
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -27,7 +31,12 @@ from src.multimcp.mcp_client import MCPClientManager
 @pytest_asyncio.fixture
 async def app_no_debug():
     """MultiMCP app with debug=False (default)."""
-    app = MultiMCP(transport="sse", host="127.0.0.1", port=18091)
+    app = MultiMCP(
+        transport="sse",
+        host="127.0.0.1",
+        port=18091,
+        management_api_key=MANAGEMENT_API_KEY,
+    )
     app.proxy = await MCPProxyServer.create(MCPClientManager())
     return app
 
@@ -35,7 +44,13 @@ async def app_no_debug():
 @pytest_asyncio.fixture
 async def app_debug():
     """MultiMCP app with debug=True."""
-    app = MultiMCP(transport="sse", host="127.0.0.1", port=18092, debug=True)
+    app = MultiMCP(
+        transport="sse",
+        host="127.0.0.1",
+        port=18092,
+        debug=True,
+        management_api_key=MANAGEMENT_API_KEY,
+    )
     app.proxy = await MCPProxyServer.create(MCPClientManager())
     return app
 
@@ -188,7 +203,7 @@ class TestApiErrorResponses:
         response = client.post(
             "/mcp_servers",
             content=b"not-valid-json{{{",
-            headers={"Content-Type": "application/json"},
+            headers={**MANAGEMENT_HEADERS, "Content-Type": "application/json"},
         )
         assert response.status_code == 400
         body = response.json()
@@ -201,6 +216,7 @@ class TestApiErrorResponses:
         response = client.post(
             "/mcp_servers",
             json={"other": "data"},
+            headers=MANAGEMENT_HEADERS,
         )
         assert response.status_code == 422
         body = response.json()
@@ -221,7 +237,9 @@ class TestApiErrorResponses:
         app_no_debug.proxy.unregister_client = _boom
 
         tc = TestClient(app_no_debug.create_starlette_app())
-        response = tc.delete("/mcp_servers/test-srv")
+        response = tc.delete(
+            "/mcp_servers/test-srv", headers=MANAGEMENT_HEADERS
+        )
         assert response.status_code == 500
         body = response.json()
         assert body.get("detail") is None
@@ -241,7 +259,9 @@ class TestApiErrorResponses:
         app_debug.proxy.unregister_client = _boom
 
         tc = TestClient(app_debug.create_starlette_app())
-        response = tc.delete("/mcp_servers/test-srv")
+        response = tc.delete(
+            "/mcp_servers/test-srv", headers=MANAGEMENT_HEADERS
+        )
         assert response.status_code == 500
         body = response.json()
         assert body.get("detail") is not None

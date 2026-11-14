@@ -1,6 +1,7 @@
 import asyncio
 import anyio
 import hmac
+import ipaddress
 import os
 import signal
 import uvicorn
@@ -38,6 +39,8 @@ class MCPSettings(BaseSettings):
     debug: bool = False  # Expose exception details in error responses (env: MULTI_MCP_DEBUG)
     config: Optional[str] = None
     api_key: Optional[str] = None  # API key for authentication (env: MULTI_MCP_API_KEY)
+    management_api_key: Optional[str] = None  # Operator key (env: MULTI_MCP_MANAGEMENT_API_KEY)
+    allow_unauthenticated_network: bool = False
     profile: Optional[str] = None  # Named profile for tool filtering (env: MULTI_MCP_PROFILE)
 
     model_config = SettingsConfigDict(env_prefix="MULTI_MCP_")
@@ -47,6 +50,7 @@ class MCPSettings(BaseSettings):
 class MultiMCP:
     def __init__(self, **settings: Any):
         self.settings = MCPSettings(**settings)
+        self._validate_security_settings()
         configure_logging(level=self.settings.log_level)
         self.logger = get_logger("MultiMCP")
         self.proxy: Optional[MCPProxyServer] = None
@@ -73,7 +77,52 @@ class MultiMCP:
     @property
     def auth_enabled(self) -> bool:
         """Check if API key authentication is enabled."""
-        return self.settings.api_key is not None and len(self.settings.api_key) > 0
+        return bool(self.settings.api_key and self.settings.api_key.strip())
+
+    @property
+    def management_auth_enabled(self) -> bool:
+        """Check if the operator-only management API is enabled."""
+        return bool(
+            self.settings.management_api_key
+            and self.settings.management_api_key.strip()
+        )
+
+    @staticmethod
+    def _is_loopback_host(host: str) -> bool:
+        """Return whether an SSE bind host is restricted to loopback."""
+        normalized = host.strip().strip("[]").rstrip(".").lower()
+        if normalized == "localhost":
+            return True
+        try:
+            return ipaddress.ip_address(normalized).is_loopback
+        except ValueError:
+            return False
+
+    def _validate_security_settings(self) -> None:
+        """Reject network and credential configurations that collapse auth boundaries."""
+        if (
+            self.settings.transport == "sse"
+            and self.auth_enabled
+            and self.management_auth_enabled
+            and hmac.compare_digest(
+                self.settings.api_key, self.settings.management_api_key
+            )
+        ):
+            raise ValueError(
+                "MULTI_MCP_MANAGEMENT_API_KEY must differ from MULTI_MCP_API_KEY"
+            )
+
+        if (
+            self.settings.transport == "sse"
+            and not self._is_loopback_host(self.settings.host)
+            and not self.auth_enabled
+            and not self.settings.allow_unauthenticated_network
+        ):
+            raise ValueError(
+                "SSE binds beyond loopback require MULTI_MCP_API_KEY; "
+                "set MULTI_MCP_ALLOW_UNAUTHENTICATED_NETWORK=true only for an "
+                "explicitly isolated deployment"
+            )
 
     async def _bootstrap_from_yaml(self, yaml_path: Path) -> MultiMCPConfig:
         """Load YAML config or run first-time discovery. Apply settings to client_manager."""
@@ -778,6 +827,44 @@ class MultiMCP:
             {"error": "Unauthorized: Missing Authorization header"}, status_code=401
         )
 
+    def _check_management_auth(self, request: Request) -> Optional[JSONResponse]:
+        """Require the distinct operator credential for mutating management routes."""
+        if not self.management_auth_enabled:
+            return JSONResponse(
+                {
+                    "error": (
+                        "Management API disabled: configure "
+                        "MULTI_MCP_MANAGEMENT_API_KEY"
+                    )
+                },
+                status_code=403,
+            )
+
+        auth_header = request.headers.get("Authorization")
+        if not auth_header:
+            return JSONResponse(
+                {"error": "Unauthorized: Missing management Authorization header"},
+                status_code=401,
+            )
+        if not auth_header.startswith("Bearer "):
+            return JSONResponse(
+                {
+                    "error": (
+                        "Unauthorized: Invalid Authorization format "
+                        "(expected 'Bearer <token>')"
+                    )
+                },
+                status_code=401,
+            )
+
+        token = auth_header[7:]
+        management_api_key = self.settings.management_api_key
+        if management_api_key and hmac.compare_digest(token, management_api_key):
+            return None
+        return JSONResponse(
+            {"error": "Unauthorized: Invalid management API key"}, status_code=401
+        )
+
     async def _auth_wrapper(self, handler, request: Request):
         """Wrapper to apply authentication check to endpoint handlers."""
         auth_error = self._check_auth(request)
@@ -866,9 +953,6 @@ class MultiMCP:
         async def auth_health(request):
             return await self._auth_wrapper(self.handle_health, request)
 
-        async def auth_mcp_control(request):
-            return await self._auth_wrapper(self.handle_mcp_control, request)
-
         async def auth_post_message(scope, receive, send):
             """Auth-protected wrapper around sse.handle_post_message."""
             if scope["type"] == "http":
@@ -888,16 +972,21 @@ class MultiMCP:
                 Route(
                     "/mcp_servers",
                     endpoint=auth_mcp_servers,
-                    methods=["GET", "POST"],
+                    methods=["GET"],
+                ),
+                Route(
+                    "/mcp_servers",
+                    endpoint=self.handle_mcp_servers,
+                    methods=["POST"],
                 ),
                 Route(
                     "/mcp_servers/{name}",
-                    endpoint=auth_mcp_servers,
+                    endpoint=self.handle_mcp_servers,
                     methods=["DELETE"],
                 ),
                 Route("/mcp_tools", endpoint=auth_mcp_tools, methods=["GET"]),
                 Route("/health", endpoint=auth_health, methods=["GET"]),
-                Route("/mcp_control", endpoint=auth_mcp_control, methods=["POST"]),
+                Route("/mcp_control", endpoint=self.handle_mcp_control, methods=["POST"]),
             ],
         )
 
@@ -919,6 +1008,11 @@ class MultiMCP:
     async def handle_mcp_servers(self, request: Request) -> JSONResponse:
         """Handle GET/POST/DELETE to list, add, or remove MCP clients at runtime."""
         method = request.method
+
+        if method in {"POST", "DELETE"}:
+            auth_error = self._check_management_auth(request)
+            if auth_error:
+                return auth_error
 
         if method == "GET":
             active = list(self.proxy.client_manager.clients.keys())
@@ -1059,6 +1153,10 @@ class MultiMCP:
 
     async def handle_mcp_control(self, request: Request) -> JSONResponse:
         """Handle POST /mcp_control for manual server enable/disable."""
+        auth_error = self._check_management_auth(request)
+        if auth_error:
+            return auth_error
+
         try:
             try:
                 payload = await request.json()

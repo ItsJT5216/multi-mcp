@@ -16,6 +16,12 @@ spec:
       - name: multi-mcp
         image: multi-mcp:latest
         imagePullPolicy: IfNotPresent
+        env:
+        - name: MULTI_MCP_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: multi-mcp-auth
+              key: api-key
         ports:
         - containerPort: 8083
 ---
@@ -24,10 +30,11 @@ kind: Service
 metadata:
   name: multi-mcp-service
 spec:
-  type: NodePort
+  # Keep the service off public node interfaces. Use a
+  # TLS-terminating, access-controlled ingress when external access is needed.
+  type: ClusterIP
   selector:
     app: multi-mcp
   ports:
   - port: 8083
     targetPort: 8083
-    nodePort: 30080

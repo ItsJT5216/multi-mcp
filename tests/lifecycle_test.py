@@ -6,7 +6,11 @@ from langchain_mcp_adapters.client import MultiServerMCPClient
 from tests.utils import run_e2e_test_with_client
 
 MCP_SERVER_URL = "http://127.0.0.1:8083"
-HEADERS = {"Content-Type": "application/json"}
+MANAGEMENT_API_KEY = "lifecycle-test-management-key"
+HEADERS = {
+    "Content-Type": "application/json",
+    "Authorization": f"Bearer {MANAGEMENT_API_KEY}",
+}
 EXPECTED_TOOLS=["convert_temperature","convert_length", "calculator__add", "calculator__multiply"]
 TEST_PROMPTS=[
         ("Convert temperature of 100 Celsius to Fahrenheit?", "212"),
@@ -31,6 +35,7 @@ async def test_mcp_servers_lifecycle():
     """
     process = await asyncio.create_subprocess_exec(
         "python", "main.py", "start", "--transport", "sse", "--config", "./examples/config/mcp.json",
+        "--management-api-key", MANAGEMENT_API_KEY,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -100,7 +105,9 @@ async def test_mcp_servers_lifecycle():
 
         async with httpx.AsyncClient() as client:
             # DELETE the server
-            resp = await client.delete(f"{MCP_SERVER_URL}/mcp_servers/unit_converter")
+            resp = await client.delete(
+                f"{MCP_SERVER_URL}/mcp_servers/unit_converter", headers=HEADERS
+            )
             assert resp.status_code == 200
             print("🗑️ Remove Response:", resp.json())
 
