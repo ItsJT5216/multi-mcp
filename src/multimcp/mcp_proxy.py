@@ -1,5 +1,6 @@
 from typing import TYPE_CHECKING, Any, Optional
 import asyncio
+import base64
 import hashlib
 import json
 import uuid
@@ -17,6 +18,9 @@ from dataclasses import dataclass
 
 if TYPE_CHECKING:
     from src.multimcp.retrieval.pipeline import RetrievalPipeline
+
+
+RESOURCE_PROVENANCE_META_KEY = "io.github.itsjt5216/multi-mcp"
 
 
 def _hash_tool_list(tools: list) -> str:
@@ -218,7 +222,8 @@ class MCPProxyServer(server.Server):
                     if "__" in resource_key:
                         continue
                     uri_str = str(resource.uri)
-                    self.resource_to_server[uri_str] = ResourceMapping(
+                    public_uri = self._make_resource_uri(name, uri_str)
+                    self.resource_to_server[public_uri] = ResourceMapping(
                         server_name=name, client=client, resource=resource
                     )
             except Exception as e:
@@ -758,13 +763,20 @@ class MCPProxyServer(server.Server):
 
     ## Resources capabilities
     async def _list_resources(self, _: Any) -> types.ServerResult:
-        """Return cached resources from all remote MCP servers."""
+        """Return cached resources with proxy-owned URI and name namespaces."""
         all_resources = []
         for key, mapping in self.resource_to_server.items():
-            namespaced_resource = mapping.resource.model_copy()
-            # Prefix name with server for disambiguation; URI stays raw for lookups
-            original_name = namespaced_resource.name or str(namespaced_resource.uri)
-            namespaced_resource.name = self._make_key(mapping.server_name, original_name)
+            raw_uri = str(mapping.resource.uri)
+            original_name = mapping.resource.name or raw_uri
+            namespaced_resource = mapping.resource.model_copy(
+                update={
+                    "name": self._make_key(mapping.server_name, original_name),
+                    "uri": key,
+                    "meta": self._resource_metadata(
+                        mapping.resource, mapping.server_name, raw_uri
+                    ),
+                }
+            )
             all_resources.append(namespaced_resource)
         return types.ServerResult(resources=all_resources)
 
@@ -777,11 +789,27 @@ class MCPProxyServer(server.Server):
 
         if mapping and mapping.client:
             try:
-                # Resource keys are raw URIs (not namespaced) — pass directly to backend
-                result = await mapping.client.read_resource(resource_uri)
+                raw_uri = str(mapping.resource.uri)
+                result = await mapping.client.read_resource(raw_uri)
             except Exception as e:
                 self.logger.error(f"❌ Failed to read resource '{resource_uri}': {e}")
                 raise McpError(ErrorData(code=INTERNAL_ERROR, message=f"Failed to read resource '{resource_uri}': {e}"))
+            namespaced_contents = []
+            for content in result.contents:
+                content_uri = str(content.uri)
+                namespaced_contents.append(
+                    content.model_copy(
+                        update={
+                            "uri": self._make_resource_uri(
+                                mapping.server_name, content_uri
+                            ),
+                            "meta": self._resource_metadata(
+                                content, mapping.server_name, content_uri
+                            ),
+                        }
+                    )
+                )
+            result = result.model_copy(update={"contents": namespaced_contents})
             return types.ServerResult(result)
 
         self.logger.error(f"⚠️ Resource '{resource_uri}' not found in any server.")
@@ -796,9 +824,15 @@ class MCPProxyServer(server.Server):
 
         if mapping and mapping.client:
             try:
-                # Resource keys are raw URIs (not namespaced) — pass directly to backend
-                await mapping.client.subscribe_resource(uri)
-                return types.ServerResult(types.EmptyResult())
+                raw_uri = str(mapping.resource.uri)
+                await mapping.client.subscribe_resource(raw_uri)
+                return types.ServerResult(
+                    types.EmptyResult(
+                        _meta=self._resource_metadata(
+                            mapping.resource, mapping.server_name, raw_uri
+                        )
+                    )
+                )
             except Exception as e:
                 self.logger.error(f"❌ Failed to subscribe to resource '{uri}': {e}")
                 raise McpError(ErrorData(code=INTERNAL_ERROR, message=f"Failed to subscribe to resource '{uri}': {e}"))
@@ -815,9 +849,15 @@ class MCPProxyServer(server.Server):
 
         if mapping and mapping.client:
             try:
-                # Resource keys are raw URIs (not namespaced) — pass directly to backend
-                await mapping.client.unsubscribe_resource(uri)
-                return types.ServerResult(types.EmptyResult())
+                raw_uri = str(mapping.resource.uri)
+                await mapping.client.unsubscribe_resource(raw_uri)
+                return types.ServerResult(
+                    types.EmptyResult(
+                        _meta=self._resource_metadata(
+                            mapping.resource, mapping.server_name, raw_uri
+                        )
+                    )
+                )
             except Exception as e:
                 self.logger.error(
                     f"❌ Failed to unsubscribe from resource '{uri}': {e}"
@@ -928,6 +968,31 @@ class MCPProxyServer(server.Server):
         if len(parts) != 2:
             raise ValueError(f"Invalid namespaced key: {key}")
         return (parts[0], parts[1])
+
+    @staticmethod
+    def _make_resource_uri(server_name: str, resource_uri: str) -> str:
+        """Build an opaque, valid URI that binds a resource to its backend."""
+
+        def encode(value: str) -> str:
+            return (
+                base64.urlsafe_b64encode(value.encode("utf-8"))
+                .decode("ascii")
+                .rstrip("=")
+            )
+
+        return f"multimcp://resource/{encode(server_name)}/{encode(resource_uri)}"
+
+    @staticmethod
+    def _resource_metadata(
+        resource: Any, server_name: str, resource_uri: str
+    ) -> dict[str, Any]:
+        """Copy backend metadata and add authoritative resource provenance."""
+        metadata = dict(getattr(resource, "meta", None) or {})
+        metadata[RESOURCE_PROVENANCE_META_KEY] = {
+            "server": server_name,
+            "uri": resource_uri,
+        }
+        return metadata
 
     async def _on_server_disconnected(self, server_name: str) -> None:
         """Reset tool, prompt, and resource mappings for a disconnected server and notify client."""

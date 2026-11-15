@@ -188,7 +188,7 @@ async def test_prompts_are_namespaced(server_with_prompts, test_prompt):
 @pytest.mark.asyncio
 async def test_resources_are_namespaced(server_with_resources, test_resource):
     """
-    Test that resources are stored by raw URI (globally unique, no namespacing needed).
+    Test that resources are stored by backend-bound public URI.
     """
     async with create_connected_server_and_client_session(
         server_with_resources
@@ -198,11 +198,14 @@ async def test_resources_are_namespaced(server_with_resources, test_resource):
 
         proxy = await MCPProxyServer.create(client_manager)
 
-        # Check internal mapping uses raw URI as key
+        # Check internal mapping uses the proxy's valid namespaced URI as key
         assert len(proxy.resource_to_server) == 1
         keys = list(proxy.resource_to_server.keys())
-        assert keys[0] == str(test_resource.uri), (
-            f"Expected '{test_resource.uri}', got '{keys[0]}'"
+        expected_uri = proxy._make_resource_uri(
+            "ResourceServer", str(test_resource.uri)
+        )
+        assert keys[0] == expected_uri, (
+            f"Expected '{expected_uri}', got '{keys[0]}'"
         )
 
 
@@ -311,9 +314,12 @@ async def test_resource_uri_with_separator_is_escaped():
 
         proxy = await MCPProxyServer.create(client_manager)
 
-        # Resources are stored by raw URI (globally unique, no namespacing)
+        # Separator-like content is encoded inside the public resource URI
         assert len(proxy.resource_to_server) == 1
         keys = list(proxy.resource_to_server.keys())
-        assert keys[0] == "file:///path::with::separator", (
-            f"Key should be raw URI. Got: {keys[0]}"
+        expected_uri = proxy._make_resource_uri(
+            "URIServer", "file:///path::with::separator"
+        )
+        assert keys[0] == expected_uri, (
+            f"Key should be namespaced URI. Got: {keys[0]}"
         )
