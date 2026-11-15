@@ -4,6 +4,7 @@ import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 from contextlib import AsyncExitStack
 from src.multimcp.mcp_client import MCPClientManager
+from src.multimcp.mcp_proxy import MCPProxyServer
 
 
 def _make_mgr(**overrides):
@@ -26,6 +27,7 @@ def _make_mgr(**overrides):
     mgr._supervision_tasks = {}
     mgr._lifecycle_tasks = {}
     mgr._shutdown_events = {}
+    mgr._silent_lifecycle_stops = set()
     mgr._reconnect_backoff = {}
     for k, v in overrides.items():
         setattr(mgr, k, v)
@@ -61,6 +63,7 @@ async def test_reconnect_closes_old_stack():
 
         await mgr._create_single_client("test_server", server_config)
 
+    old_stack.aclose.assert_awaited_once()
     # A new client must have been registered
     assert "test_server" in mgr.clients
     # Lifecycle task should be running
@@ -77,8 +80,8 @@ async def test_reconnect_closes_old_stack():
             pass
 
 
-def test_cleanup_server_state_removes_all_entries():
-    """cleanup_server_state must remove ALL per-server dicts."""
+def test_cleanup_server_state_removes_configuration_entries():
+    """cleanup_server_state removes configuration after async teardown."""
     mgr = _make_mgr()
     mgr.pending_configs = {"srv": {"command": "node"}}
     mgr.server_configs = {"srv": {"command": "node"}}
@@ -86,7 +89,7 @@ def test_cleanup_server_state_removes_all_entries():
     mgr.idle_timeouts = {"srv": 300}
     mgr.last_used = {"srv": 12345.0}
     mgr._creation_locks = {"srv": asyncio.Lock()}
-    mgr.clients = {"srv": MagicMock()}
+    mgr.always_on_servers = {"srv"}
 
     mgr.cleanup_server_state("srv")
 
@@ -96,7 +99,7 @@ def test_cleanup_server_state_removes_all_entries():
     assert "srv" not in mgr.idle_timeouts
     assert "srv" not in mgr.last_used
     assert "srv" not in mgr._creation_locks
-    assert "srv" not in mgr.clients
+    assert "srv" not in mgr.always_on_servers
 
 
 @pytest.mark.asyncio
@@ -122,7 +125,7 @@ async def test_supervision_cleans_up_dead_client():
 
     assert "github" not in mgr.clients
     assert "github" not in mgr.server_stacks
-    mock_stack.aclose.assert_not_called()
+    mock_stack.aclose.assert_awaited_once()
     mgr._on_server_disconnected.assert_called_once_with("github")
 
 
@@ -183,3 +186,133 @@ async def test_lifecycle_task_catches_backend_crash():
             pass
 
     assert "crashing" not in mgr.clients
+
+
+@pytest.mark.asyncio
+async def test_stop_server_lifecycle_removes_all_runtime_resources():
+    """The shared teardown signals, awaits, closes, and removes one lifecycle."""
+    mgr = _make_mgr()
+    shutdown_event = asyncio.Event()
+    stack = AsyncMock(spec=AsyncExitStack)
+
+    async def _lifecycle():
+        await shutdown_event.wait()
+
+    task = asyncio.create_task(_lifecycle())
+    mgr.clients["srv"] = AsyncMock()
+    mgr.server_stacks["srv"] = stack
+    mgr._shutdown_events["srv"] = shutdown_event
+    mgr._lifecycle_tasks["srv"] = task
+
+    await mgr._stop_server_lifecycle("srv")
+
+    assert shutdown_event.is_set()
+    assert task.done()
+    stack.aclose.assert_awaited_once()
+    assert "srv" not in mgr.clients
+    assert "srv" not in mgr.server_stacks
+    assert "srv" not in mgr._shutdown_events
+    assert "srv" not in mgr._lifecycle_tasks
+
+
+@pytest.mark.asyncio
+async def test_connection_timeout_stops_detached_lifecycle():
+    """A timed-out creator cannot leave its independently spawned task behind."""
+    mgr = MCPClientManager(connection_timeout=0.001)
+    config = {"command": "python", "args": []}
+    mgr.pending_configs["srv"] = config
+    mgr.server_configs["srv"] = config
+
+    async def _partial_creation(name, _config):
+        shutdown_event = asyncio.Event()
+        lifecycle = asyncio.create_task(shutdown_event.wait())
+        mgr._shutdown_events[name] = shutdown_event
+        mgr._lifecycle_tasks[name] = lifecycle
+        await asyncio.sleep(10)
+
+    with patch.object(mgr, "_create_single_client", side_effect=_partial_creation):
+        with pytest.raises(asyncio.TimeoutError):
+            await mgr.get_or_create_client("srv")
+
+    assert mgr.pending_configs["srv"] is config
+    assert "srv" not in mgr._shutdown_events
+    assert "srv" not in mgr._lifecycle_tasks
+
+
+@pytest.mark.asyncio
+async def test_idle_disconnect_stops_lifecycle_and_preserves_retry():
+    """Idle eviction tears down runtime resources while retaining lazy reconnect state."""
+    callback = AsyncMock()
+    mgr = MCPClientManager(on_server_disconnected=callback)
+    config = {"command": "python", "args": []}
+    shutdown_event = asyncio.Event()
+    lifecycle = asyncio.create_task(shutdown_event.wait())
+    stack = AsyncMock(spec=AsyncExitStack)
+    mgr.server_configs["srv"] = config
+    mgr.clients["srv"] = AsyncMock()
+    mgr.server_stacks["srv"] = stack
+    mgr._shutdown_events["srv"] = shutdown_event
+    mgr._lifecycle_tasks["srv"] = lifecycle
+    mgr.idle_timeouts["srv"] = 0.01
+    mgr.last_used["srv"] = 0
+
+    await mgr._disconnect_idle_servers()
+
+    assert mgr.pending_configs["srv"] is config
+    assert lifecycle.done()
+    stack.aclose.assert_awaited_once()
+    assert "srv" not in mgr.clients
+    assert "srv" not in mgr._lifecycle_tasks
+    callback.assert_awaited_once_with("srv")
+
+
+@pytest.mark.asyncio
+async def test_unregister_stops_lifecycle_and_removes_configuration():
+    """Runtime unregister closes resources before deleting persistent server state."""
+    mgr = MCPClientManager()
+    proxy = MCPProxyServer(mgr)
+    config = {"command": "python", "args": []}
+    shutdown_event = asyncio.Event()
+    lifecycle = asyncio.create_task(shutdown_event.wait())
+    stack = AsyncMock(spec=AsyncExitStack)
+    mgr.server_configs["srv"] = config
+    mgr.pending_configs["srv"] = config
+    mgr.clients["srv"] = AsyncMock()
+    mgr.server_stacks["srv"] = stack
+    mgr._shutdown_events["srv"] = shutdown_event
+    mgr._lifecycle_tasks["srv"] = lifecycle
+
+    await proxy.unregister_client("srv")
+
+    assert lifecycle.done()
+    stack.aclose.assert_awaited_once()
+    assert "srv" not in mgr.clients
+    assert "srv" not in mgr.server_stacks
+    assert "srv" not in mgr.pending_configs
+    assert "srv" not in mgr.server_configs
+
+
+@pytest.mark.asyncio
+async def test_failed_registration_stops_lifecycle_and_preserves_retry():
+    """Handshake failure tears down runtime resources but keeps configuration retryable."""
+    mgr = MCPClientManager()
+    proxy = MCPProxyServer(mgr)
+    config = {"command": "python", "args": []}
+    shutdown_event = asyncio.Event()
+    lifecycle = asyncio.create_task(shutdown_event.wait())
+    stack = AsyncMock(spec=AsyncExitStack)
+    client = AsyncMock()
+    client.initialize.side_effect = RuntimeError("handshake failed")
+    mgr.server_configs["srv"] = config
+    mgr.server_stacks["srv"] = stack
+    mgr._shutdown_events["srv"] = shutdown_event
+    mgr._lifecycle_tasks["srv"] = lifecycle
+
+    with pytest.raises(RuntimeError, match="handshake failed"):
+        await proxy.register_client("srv", client)
+
+    assert lifecycle.done()
+    stack.aclose.assert_awaited_once()
+    assert "srv" not in mgr.clients
+    assert "srv" not in mgr.server_stacks
+    assert mgr.pending_configs["srv"] is config
