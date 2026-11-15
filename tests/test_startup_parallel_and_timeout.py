@@ -7,11 +7,9 @@
    Timing proofs: N servers x DELAY each must finish well under N*DELAY.
    Regression guards: per-server failure isolation semantics are preserved.
 
-2. Per-server tool-call timeout — ServerConfig.tool_call_timeout_seconds.
-   Default None preserves previous behavior exactly (no kwarg passed at all).
-   When set, a hung backend returns an isError timeout response instead of
-   stalling the request forever, and the failure counts toward the proxy's
-   circuit breaker.
+2. Backend operation deadlines and limits. Tool calls inherit a finite default,
+   explicit tool deadlines still override it, and oversized catalogs are
+   rejected before entries are copied into the proxy registries.
 """
 
 import asyncio
@@ -220,7 +218,7 @@ async def test_connect_json_config_servers_failure_isolated():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Improvement 2: per-server tool_call_timeout_seconds
+# Improvement 2: finite backend operation limits
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -275,8 +273,8 @@ async def test_tool_call_timeout_wired_when_configured():
 
 
 @pytest.mark.asyncio
-async def test_tool_call_no_timeout_by_default():
-    """No config → call_tool invoked WITHOUT read_timeout_seconds (previous behavior)."""
+async def test_tool_call_inherits_finite_timeout_by_default():
+    """An unset tool override inherits the finite backend operation deadline."""
     mock_client = AsyncMock()
     mock_client.call_tool = AsyncMock(
         return_value=types.CallToolResult(content=[])
@@ -286,29 +284,83 @@ async def test_tool_call_no_timeout_by_default():
     await proxy._call_tool(_call_req("srv__echo"))
 
     _, kwargs = mock_client.call_tool.call_args
-    assert "read_timeout_seconds" not in kwargs
+    assert kwargs["read_timeout_seconds"] == timedelta(seconds=30)
 
 
 def test_get_tool_call_timeout_resolution():
-    """Helper returns the timeout only for valid positive numeric configs."""
+    """Invalid or unset tool overrides fall back to a finite operation deadline."""
     manager = MCPClientManager()
     manager.server_configs = {
         "valid": {"tool_call_timeout_seconds": 12.5},
         "valid_int": {"tool_call_timeout_seconds": 30},
-        "zero": {"tool_call_timeout_seconds": 0},
+        "zero": {
+            "tool_call_timeout_seconds": 0,
+            "operation_timeout_seconds": 9,
+        },
         "negative": {"tool_call_timeout_seconds": -5},
         "wrong_type": {"tool_call_timeout_seconds": "abc"},
-        "unset": {"command": "echo"},
+        "unset": {"command": "echo", "operation_timeout_seconds": 17},
     }
     proxy = MCPProxyServer(manager)
 
     assert proxy._get_tool_call_timeout("valid") == 12.5
     assert proxy._get_tool_call_timeout("valid_int") == 30.0
-    assert proxy._get_tool_call_timeout("zero") is None
-    assert proxy._get_tool_call_timeout("negative") is None
-    assert proxy._get_tool_call_timeout("wrong_type") is None
-    assert proxy._get_tool_call_timeout("unset") is None
-    assert proxy._get_tool_call_timeout("unknown_server") is None
+    assert proxy._get_tool_call_timeout("zero") == 9.0
+    assert proxy._get_tool_call_timeout("negative") == 30.0
+    assert proxy._get_tool_call_timeout("wrong_type") == 30.0
+    assert proxy._get_tool_call_timeout("unset") == 17.0
+    assert proxy._get_tool_call_timeout("unknown_server") == 30.0
+
+
+@pytest.mark.asyncio
+async def test_backend_deadline_covers_concurrency_queue():
+    """A queued operation must time out without invoking the backend callable."""
+    proxy = MCPProxyServer(MCPClientManager())
+    semaphore = asyncio.Semaphore(1)
+    await semaphore.acquire()
+    proxy._backend_operation_semaphores["busy"] = semaphore
+    operation = AsyncMock()
+
+    with pytest.raises(TimeoutError, match="tools/list timed out"):
+        await proxy._run_backend_operation(
+            "busy", "tools/list", operation, timeout_seconds=0.01
+        )
+
+    operation.assert_not_awaited()
+    semaphore.release()
+
+
+@pytest.mark.asyncio
+async def test_admitted_handler_delegates_and_releases_slots():
+    """An admitted request keeps normal dispatch and returns both capacity slots."""
+    proxy = MCPProxyServer(MCPClientManager())
+    proxy._request_semaphore = asyncio.Semaphore(0)
+    session_semaphore = asyncio.Semaphore(0)
+    proxy._handle_message = AsyncMock()
+    message = MagicMock()
+    session = MagicMock()
+    lifespan = MagicMock()
+
+    await proxy._handle_message_with_limits(
+        message, session, lifespan, False, session_semaphore
+    )
+
+    proxy._handle_message.assert_awaited_once_with(
+        message, session, lifespan, False
+    )
+    await asyncio.wait_for(proxy._request_semaphore.acquire(), timeout=0.1)
+    await asyncio.wait_for(session_semaphore.acquire(), timeout=0.1)
+
+
+def test_catalog_limit_rejects_before_registry_copy():
+    """Per-server catalog limits reject excess entries and preserve normal catalogs."""
+    manager = MCPClientManager()
+    manager.server_configs["svc"] = {"max_catalog_items": 2}
+    proxy = MCPProxyServer(manager)
+
+    proxy._ensure_catalog_size("svc", "tools", ["one", "two"])
+    with pytest.raises(ValueError, match="returned 3 tools; limit is 2"):
+        proxy._ensure_catalog_size("svc", "tools", ["one", "two", "three"])
 
 
 @pytest.mark.asyncio
@@ -356,13 +408,15 @@ async def test_slow_backend_times_out_e2e():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Config plumbing for tool_call_timeout_seconds
+# Config plumbing for backend operation deadlines
 # ─────────────────────────────────────────────────────────────────────────────
 
 
 def test_server_config_timeout_field_validation():
-    """Field defaults to None, accepts positive numbers, rejects <= 0."""
-    assert ServerConfig(command="echo").tool_call_timeout_seconds is None
+    """Operation deadlines are finite and optional tool overrides stay validated."""
+    default_config = ServerConfig(command="echo")
+    assert default_config.operation_timeout_seconds == 30.0
+    assert default_config.tool_call_timeout_seconds is None
     assert ServerConfig(
         command="echo", tool_call_timeout_seconds=30
     ).tool_call_timeout_seconds == 30.0
@@ -371,6 +425,10 @@ def test_server_config_timeout_field_validation():
         ServerConfig(command="echo", tool_call_timeout_seconds=0)
     with pytest.raises(ValidationError):
         ServerConfig(command="echo", tool_call_timeout_seconds=-1)
+    with pytest.raises(ValidationError):
+        ServerConfig(command="echo", operation_timeout_seconds=float("inf"))
+    with pytest.raises(ValidationError):
+        ServerConfig(command="echo", tool_call_timeout_seconds=3601)
 
     # exclude_none keeps unset timeout out of server dicts (previous shape kept)
     assert "tool_call_timeout_seconds" not in ServerConfig(
@@ -385,17 +443,23 @@ def test_server_config_timeout_field_validation():
 
 
 def test_server_config_timeout_yaml_roundtrip(tmp_path):
-    """tool_call_timeout_seconds survives save_config/load_config."""
+    """General and tool-specific backend deadlines survive YAML round trips."""
     path = tmp_path / "servers.yaml"
     config = MultiMCPConfig(
         servers={
-            "svc": ServerConfig(command="echo", tool_call_timeout_seconds=45),
+            "svc": ServerConfig(
+                command="echo",
+                operation_timeout_seconds=60,
+                tool_call_timeout_seconds=45,
+            ),
             "other": ServerConfig(command="echo"),
         }
     )
     save_config(config, path)
     loaded = load_config(path)
+    assert loaded.servers["svc"].operation_timeout_seconds == 60.0
     assert loaded.servers["svc"].tool_call_timeout_seconds == 45.0
+    assert loaded.servers["other"].operation_timeout_seconds == 30.0
     assert loaded.servers["other"].tool_call_timeout_seconds is None
 
 
@@ -412,3 +476,22 @@ async def test_create_clients_eager_stores_server_configs():
 
     assert manager.server_configs["svc"]["tool_call_timeout_seconds"] == 9
     await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_create_clients_eager_connection_is_bounded():
+    """Dynamic eager connections time out and stop their lifecycle task."""
+    manager = MCPClientManager(connection_timeout=0.01)
+
+    async def never_connect(*args, **kwargs):
+        await asyncio.Event().wait()
+
+    manager._create_single_client = never_connect
+    manager._stop_server_lifecycle = AsyncMock()
+
+    with pytest.raises(asyncio.TimeoutError):
+        await manager.create_clients(
+            {"mcpServers": {"slow": {"command": "echo"}}}
+        )
+
+    manager._stop_server_lifecycle.assert_awaited_once_with("slow")

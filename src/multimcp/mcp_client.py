@@ -453,6 +453,7 @@ class MCPClientManager:
                             timeout=self._connection_timeout,
                         )
                     except asyncio.TimeoutError:
+                        await self._stop_server_lifecycle(name)
                         self.pending_configs[name] = config
                         self.logger.error(f"❌ Connection timeout for {name}")
                         raise
@@ -760,7 +761,17 @@ class MCPClientManager:
                 self.logger.warning(
                     f"⚠️ Client '{name}' already exists and will be overridden."
                 )
-            await self._create_single_client(name, server)
+            async with self._get_creation_lock(name):
+                async with self._connection_semaphore:
+                    try:
+                        await asyncio.wait_for(
+                            self._create_single_client(name, server),
+                            timeout=self._connection_timeout,
+                        )
+                    except asyncio.TimeoutError:
+                        await self._stop_server_lifecycle(name)
+                        self.logger.error(f"❌ Connection timeout for {name}")
+                        raise
 
         return self.clients
 

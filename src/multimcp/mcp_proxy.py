@@ -19,6 +19,15 @@ if TYPE_CHECKING:
     from src.multimcp.retrieval.pipeline import RetrievalPipeline
 
 
+DEFAULT_BACKEND_OPERATION_TIMEOUT_SECONDS = 30.0
+MAX_BACKEND_OPERATION_TIMEOUT_SECONDS = 3600.0
+DEFAULT_MAX_CATALOG_ITEMS = 1000
+MAX_CONCURRENT_REQUESTS = 64
+MAX_CONCURRENT_REQUESTS_PER_SESSION = 16
+MAX_CONCURRENT_BACKEND_OPERATIONS_PER_SERVER = 8
+CLIENT_SESSION_OPERATION_TIMEOUT_SECONDS = 30.0
+
+
 def _hash_tool_list(tools: list) -> str:
     """Stable hash of a tool list for change detection.
 
@@ -98,6 +107,11 @@ class MCPProxyServer(server.Server):
         self._tool_failure_counts: dict[str, int] = {}
         # After this many consecutive transport failures, auto-quarantine the tool
         self.quarantine_threshold: int = 3
+        # Admission controls are acquired before a handler task is created. This
+        # bounds process-wide task retention while each run() adds a fairer,
+        # per-session limit so one client cannot consume every global slot.
+        self._request_semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+        self._backend_operation_semaphores: dict[str, asyncio.Semaphore] = {}
         # Register roots/list_changed notification handler
         self.notification_handlers[types.RootsListChangedNotification] = (
             self._handle_roots_list_changed
@@ -191,7 +205,12 @@ class MCPProxyServer(server.Server):
             if self.client_manager
             else 30.0
         )
-        result = await asyncio.wait_for(client.initialize(), timeout=timeout)
+        result = await self._run_backend_operation(
+            name,
+            "initialize",
+            client.initialize,
+            timeout_seconds=min(timeout, self._get_backend_operation_timeout(name)),
+        )
         self.capabilities[name] = result.capabilities
 
         if result.capabilities.tools:
@@ -199,7 +218,10 @@ class MCPProxyServer(server.Server):
 
         if result.capabilities.prompts:
             try:
-                prompts_result = await client.list_prompts()
+                prompts_result = await self._run_backend_operation(
+                    name, "prompts/list", client.list_prompts
+                )
+                self._ensure_catalog_size(name, "prompts", prompts_result.prompts)
                 for prompt in prompts_result.prompts:
                     if "__" in prompt.name:
                         continue
@@ -212,7 +234,10 @@ class MCPProxyServer(server.Server):
 
         if result.capabilities.resources:
             try:
-                resources_result = await client.list_resources()
+                resources_result = await self._run_backend_operation(
+                    name, "resources/list", client.list_resources
+                )
+                self._ensure_catalog_size(name, "resources", resources_result.resources)
                 for resource in resources_result.resources:
                     resource_key = resource.name if resource.name else resource.uri
                     if "__" in resource_key:
@@ -257,6 +282,7 @@ class MCPProxyServer(server.Server):
             del self.client_manager.clients[name]
 
             self.capabilities.pop(name, None)
+            self._backend_operation_semaphores.pop(name, None)
 
             # Fix: filter by server_name, not client identity.
             # After disconnect, client is set to None, so v.client != client
@@ -424,7 +450,10 @@ class MCPProxyServer(server.Server):
         if self._server_session is None:
             return
         try:
-            result = await self._server_session.list_roots()
+            result = await asyncio.wait_for(
+                self._server_session.list_roots(),
+                timeout=CLIENT_SESSION_OPERATION_TIMEOUT_SECONDS,
+            )
             root_uris = [r.uri for r in result.roots]
             await self.retrieval_pipeline.set_session_roots(session_id, root_uris)
             self.logger.debug(
@@ -609,16 +638,16 @@ class MCPProxyServer(server.Server):
                 )
                 _, original_name = self._split_key(tool_name)
                 timeout_s = self._get_tool_call_timeout(tool_item.server_name)
-                if timeout_s is not None:
-                    result = await tool_item.client.call_tool(
+                result = await self._run_backend_operation(
+                    tool_item.server_name,
+                    "tools/call",
+                    lambda: tool_item.client.call_tool(
                         original_name,
                         arguments,
                         read_timeout_seconds=timedelta(seconds=timeout_s),
-                    )
-                else:
-                    result = await tool_item.client.call_tool(
-                        original_name, arguments
-                    )
+                    ),
+                    timeout_seconds=timeout_s,
+                )
 
                 # Log successful tool invocation (use original name for cross-referencing)
                 self.audit_logger.log_tool_call(
@@ -723,7 +752,13 @@ class MCPProxyServer(server.Server):
         if mapping and mapping.client:
             try:
                 _, original_name = self._split_key(prompt_name)
-                result = await mapping.client.get_prompt(original_name, req.params.arguments)
+                result = await self._run_backend_operation(
+                    mapping.server_name,
+                    "prompts/get",
+                    lambda: mapping.client.get_prompt(
+                        original_name, req.params.arguments
+                    ),
+                )
             except Exception as e:
                 self.logger.error(f"❌ Failed to get prompt '{prompt_name}': {e}")
                 raise McpError(ErrorData(code=INTERNAL_ERROR, message=f"Failed to get prompt '{prompt_name}': {e}"))
@@ -746,7 +781,11 @@ class MCPProxyServer(server.Server):
                 if hasattr(ref, 'name'):
                     _, original_name = self._split_key(ref.name)
                     ref = ref.model_copy(update={"name": original_name})
-                result = await mapping.client.complete(ref, req.params.argument)
+                result = await self._run_backend_operation(
+                    mapping.server_name,
+                    "completion/complete",
+                    lambda: mapping.client.complete(ref, req.params.argument),
+                )
             except Exception as e:
                 self.logger.error(f"❌ Failed to complete prompt '{prompt_name}': {e}")
                 raise McpError(ErrorData(code=INTERNAL_ERROR, message=f"Failed to complete prompt '{prompt_name}': {e}"))
@@ -778,7 +817,11 @@ class MCPProxyServer(server.Server):
         if mapping and mapping.client:
             try:
                 # Resource keys are raw URIs (not namespaced) — pass directly to backend
-                result = await mapping.client.read_resource(resource_uri)
+                result = await self._run_backend_operation(
+                    mapping.server_name,
+                    "resources/read",
+                    lambda: mapping.client.read_resource(resource_uri),
+                )
             except Exception as e:
                 self.logger.error(f"❌ Failed to read resource '{resource_uri}': {e}")
                 raise McpError(ErrorData(code=INTERNAL_ERROR, message=f"Failed to read resource '{resource_uri}': {e}"))
@@ -797,7 +840,11 @@ class MCPProxyServer(server.Server):
         if mapping and mapping.client:
             try:
                 # Resource keys are raw URIs (not namespaced) — pass directly to backend
-                await mapping.client.subscribe_resource(uri)
+                await self._run_backend_operation(
+                    mapping.server_name,
+                    "resources/subscribe",
+                    lambda: mapping.client.subscribe_resource(uri),
+                )
                 return types.ServerResult(types.EmptyResult())
             except Exception as e:
                 self.logger.error(f"❌ Failed to subscribe to resource '{uri}': {e}")
@@ -816,7 +863,11 @@ class MCPProxyServer(server.Server):
         if mapping and mapping.client:
             try:
                 # Resource keys are raw URIs (not namespaced) — pass directly to backend
-                await mapping.client.unsubscribe_resource(uri)
+                await self._run_backend_operation(
+                    mapping.server_name,
+                    "resources/unsubscribe",
+                    lambda: mapping.client.unsubscribe_resource(uri),
+                )
                 return types.ServerResult(types.EmptyResult())
             except Exception as e:
                 self.logger.error(
@@ -860,7 +911,10 @@ class MCPProxyServer(server.Server):
             else None
         )
 
-        tools_result = await client.list_tools()
+        tools_result = await self._run_backend_operation(
+            server_name, "tools/list", client.list_tools
+        )
+        self._ensure_catalog_size(server_name, "tools", tools_result.tools)
         for tool in tools_result.tools:
             if not self._is_tool_allowed(tool.name, tool_filter):
                 self.logger.debug(
@@ -883,13 +937,8 @@ class MCPProxyServer(server.Server):
 
         return tool_list
 
-    def _get_tool_call_timeout(self, server_name: str) -> Optional[float]:
-        """Resolve the configured tool-call timeout (seconds) for a server.
-
-        Reads ``tool_call_timeout_seconds`` from the client manager's stored
-        server config. Returns None (wait indefinitely — previous behavior)
-        when unset, unconfigured, or invalid.
-        """
+    def _get_server_config_value(self, server_name: str, key: str) -> Any:
+        """Return a raw per-server value without trusting dynamic config types."""
         if not self.client_manager:
             return None
         configs = getattr(self.client_manager, "server_configs", None)
@@ -898,10 +947,90 @@ class MCPProxyServer(server.Server):
         server_cfg = configs.get(server_name)
         if not isinstance(server_cfg, dict):
             return None
-        timeout = server_cfg.get("tool_call_timeout_seconds")
-        if isinstance(timeout, (int, float)) and timeout > 0:
+        return server_cfg.get(key)
+
+    def _get_backend_operation_timeout(self, server_name: str) -> float:
+        """Resolve a finite backend deadline, falling back safely for raw configs."""
+        timeout = self._get_server_config_value(
+            server_name, "operation_timeout_seconds"
+        )
+        if (
+            isinstance(timeout, (int, float))
+            and not isinstance(timeout, bool)
+            and 0 < timeout <= MAX_BACKEND_OPERATION_TIMEOUT_SECONDS
+        ):
             return float(timeout)
-        return None
+        return DEFAULT_BACKEND_OPERATION_TIMEOUT_SECONDS
+
+    def _get_tool_call_timeout(self, server_name: str) -> float:
+        """Resolve the configured tool-call timeout (seconds) for a server.
+
+        A positive tool-specific value overrides the general operation deadline;
+        unset or invalid raw dynamic values inherit the finite general default.
+        """
+        timeout = self._get_server_config_value(
+            server_name, "tool_call_timeout_seconds"
+        )
+        if (
+            isinstance(timeout, (int, float))
+            and not isinstance(timeout, bool)
+            and 0 < timeout <= MAX_BACKEND_OPERATION_TIMEOUT_SECONDS
+        ):
+            return float(timeout)
+        return self._get_backend_operation_timeout(server_name)
+
+    def _get_max_catalog_items(self, server_name: str) -> int:
+        limit = self._get_server_config_value(server_name, "max_catalog_items")
+        if (
+            isinstance(limit, int)
+            and not isinstance(limit, bool)
+            and 1 <= limit <= 10000
+        ):
+            return limit
+        return DEFAULT_MAX_CATALOG_ITEMS
+
+    def _ensure_catalog_size(
+        self, server_name: str, catalog_name: str, items: list
+    ) -> None:
+        """Reject oversized catalogs before copying entries into proxy registries."""
+        limit = self._get_max_catalog_items(server_name)
+        if len(items) > limit:
+            raise ValueError(
+                f"Backend '{server_name}' returned {len(items)} {catalog_name}; "
+                f"limit is {limit}"
+            )
+
+    async def _run_backend_operation(
+        self,
+        server_name: str,
+        operation_name: str,
+        operation,
+        timeout_seconds: Optional[float] = None,
+    ) -> Any:
+        """Run one backend operation with a queue-inclusive deadline and limit."""
+        timeout = timeout_seconds
+        if (
+            not isinstance(timeout, (int, float))
+            or isinstance(timeout, bool)
+            or timeout <= 0
+            or timeout > MAX_BACKEND_OPERATION_TIMEOUT_SECONDS
+        ):
+            timeout = self._get_backend_operation_timeout(server_name)
+        semaphore = self._backend_operation_semaphores.setdefault(
+            server_name,
+            asyncio.Semaphore(MAX_CONCURRENT_BACKEND_OPERATIONS_PER_SERVER),
+        )
+
+        async def _bounded_operation() -> Any:
+            async with semaphore:
+                return await operation()
+
+        try:
+            return await asyncio.wait_for(_bounded_operation(), timeout=timeout)
+        except asyncio.TimeoutError as exc:
+            raise TimeoutError(
+                f"Backend '{server_name}' {operation_name} timed out after {timeout:g}s"
+            ) from exc
 
     @staticmethod
     def _is_tool_allowed(tool_name: str, filter_config: Optional[dict]) -> bool:
@@ -950,7 +1079,10 @@ class MCPProxyServer(server.Server):
         """Send tools/list_changed notification if a session is active."""
         if self._server_session:
             try:
-                await self._server_session.send_tool_list_changed()
+                await asyncio.wait_for(
+                    self._server_session.send_tool_list_changed(),
+                    timeout=CLIENT_SESSION_OPERATION_TIMEOUT_SECONDS,
+                )
                 self.logger.info("📢 Sent tools/list_changed notification")
             except Exception as e:
                 self.logger.error(
@@ -965,7 +1097,10 @@ class MCPProxyServer(server.Server):
         """Send prompts/list_changed notification if a session is active."""
         if self._server_session:
             try:
-                await self._server_session.send_prompts_list_changed()
+                await asyncio.wait_for(
+                    self._server_session.send_prompts_list_changed(),
+                    timeout=CLIENT_SESSION_OPERATION_TIMEOUT_SECONDS,
+                )
                 self.logger.info("📢 Sent prompts/list_changed notification")
             except Exception as e:
                 self.logger.error(
@@ -980,7 +1115,10 @@ class MCPProxyServer(server.Server):
         """Send resources/list_changed notification if a session is active."""
         if self._server_session:
             try:
-                await self._server_session.send_resources_list_changed()
+                await asyncio.wait_for(
+                    self._server_session.send_resources_list_changed(),
+                    timeout=CLIENT_SESSION_OPERATION_TIMEOUT_SECONDS,
+                )
                 self.logger.info("📢 Sent resources/list_changed notification")
             except Exception as e:
                 self.logger.error(
@@ -990,6 +1128,26 @@ class MCPProxyServer(server.Server):
             self.logger.debug(
                 "⚠️ No active session to send resources/list_changed notification"
             )
+
+    async def _handle_message_with_limits(
+        self,
+        message: Any,
+        session: ServerSession,
+        lifespan_context: Any,
+        raise_exceptions: bool,
+        session_semaphore: asyncio.Semaphore,
+    ) -> None:
+        """Handle an admitted message and always return both capacity slots."""
+        try:
+            await self._handle_message(
+                message,
+                session,
+                lifespan_context,
+                raise_exceptions,
+            )
+        finally:
+            self._request_semaphore.release()
+            session_semaphore.release()
 
     async def run(
         self,
@@ -1023,6 +1181,9 @@ class MCPProxyServer(server.Server):
 
             # Request roots/list after session init (Step A + C from source plan §5)
             session_id = self._get_session_id()
+            session_request_semaphore = asyncio.Semaphore(
+                MAX_CONCURRENT_REQUESTS_PER_SESSION
+            )
 
             # Call parent's message handling loop
             async with anyio.create_task_group() as tg:
@@ -1031,13 +1192,29 @@ class MCPProxyServer(server.Server):
                 async for message in session.incoming_messages:
                     self.logger.debug(f"Received message: {message}")
 
-                    tg.start_soon(
-                        self._handle_message,
-                        message,
-                        session,
-                        lifespan_context,
-                        raise_exceptions,
-                    )
+                    # Acquire capacity before creating a child task. Waiting here
+                    # backpressures the session stream instead of retaining an
+                    # unbounded task and request arguments for every message.
+                    await session_request_semaphore.acquire()
+                    try:
+                        await self._request_semaphore.acquire()
+                    except BaseException:
+                        session_request_semaphore.release()
+                        raise
+
+                    try:
+                        tg.start_soon(
+                            self._handle_message_with_limits,
+                            message,
+                            session,
+                            lifespan_context,
+                            raise_exceptions,
+                            session_request_semaphore,
+                        )
+                    except BaseException:
+                        self._request_semaphore.release()
+                        session_request_semaphore.release()
+                        raise
 
             # Clear session when done
             if self.retrieval_pipeline is not None and hasattr(self.retrieval_pipeline, "cleanup_session"):
