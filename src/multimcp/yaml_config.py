@@ -23,14 +23,25 @@ class ServerConfig(BaseModel):
     type: Literal["stdio", "sse", "http", "streamablehttp"] = "stdio"
     always_on: bool = False
     idle_timeout_minutes: int = 5
-    tool_call_timeout_seconds: Optional[float] = Field(default=None, gt=0)
+    operation_timeout_seconds: float = Field(
+        default=30.0, gt=0, le=3600, allow_inf_nan=False
+    )
+    """Maximum wall-clock seconds for a backend MCP operation.
+
+    The deadline includes time waiting for that backend's concurrency slot.
+    Individual tool calls may override it with ``tool_call_timeout_seconds``.
+    """
+    tool_call_timeout_seconds: Optional[float] = Field(
+        default=None, gt=0, le=3600, allow_inf_nan=False
+    )
     """Max seconds to wait for a tool call response from this server.
 
-    When *None* (the default) tool calls wait indefinitely (previous behavior).
-    When set, a hung backend returns a timeout error to the caller instead of
-    stalling the request forever; repeated timeouts trip the proxy's
-    circuit breaker and auto-quarantine the tool.
+    When *None* (the default), tool calls inherit ``operation_timeout_seconds``.
+    A hung backend therefore returns a timeout error instead of retaining the
+    request indefinitely; repeated timeouts trip the proxy's circuit breaker.
     """
+    max_catalog_items: int = Field(default=1000, ge=1, le=10000)
+    """Maximum tools, prompts, or resources retained from one backend catalog."""
     tools: dict[str, ToolEntry] = Field(default_factory=dict)
     triggers: list[str] = Field(default_factory=list)
 

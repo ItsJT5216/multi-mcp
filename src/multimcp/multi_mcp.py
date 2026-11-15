@@ -25,6 +25,40 @@ from src.multimcp.cache_manager import merge_discovered_tools, get_enabled_tools
 from src.utils.logger import configure_logging, get_logger
 
 YAML_CONFIG_PATH = Path.home() / ".config" / "multi-mcp" / "servers.yaml"
+MAX_HTTP_REQUEST_BODY_BYTES = 1024 * 1024
+MAX_CONCURRENT_HTTP_REQUESTS = 128
+MAX_CONFIGURED_BACKENDS = 100
+
+
+class RequestBodyTooLarge(ValueError):
+    """Raised before an HTTP request body can grow beyond the configured cap."""
+
+
+def _content_length_exceeds(scope: dict, limit: int) -> bool:
+    """Reject a declared oversized body without reading it from the ASGI server."""
+    for name, value in scope.get("headers", []):
+        if name.lower() != b"content-length":
+            continue
+        try:
+            return int(value) > limit
+        except ValueError:
+            return False
+    return False
+
+
+async def _read_bounded_json(
+    request: Request, limit: int = MAX_HTTP_REQUEST_BODY_BYTES
+) -> Any:
+    """Read and decode JSON while enforcing the limit for streamed bodies too."""
+    if _content_length_exceeds(request.scope, limit):
+        raise RequestBodyTooLarge(f"Request body exceeds {limit} bytes")
+
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > limit:
+            raise RequestBodyTooLarge(f"Request body exceeds {limit} bytes")
+        body.extend(chunk)
+    return json.loads(body)
 
 
 class MCPSettings(BaseSettings):
@@ -877,7 +911,33 @@ class MultiMCP:
                 if auth_error:
                     await auth_error(scope, receive, send)
                     return
-            await sse.handle_post_message(scope, receive, send)
+                if _content_length_exceeds(scope, MAX_HTTP_REQUEST_BODY_BYTES):
+                    response = JSONResponse(
+                        {"error": "Request body too large"}, status_code=413
+                    )
+                    await response(scope, receive, send)
+                    return
+
+            received_bytes = 0
+
+            async def receive_bounded():
+                nonlocal received_bytes
+                message = await receive()
+                if message.get("type") == "http.request":
+                    received_bytes += len(message.get("body", b""))
+                    if received_bytes > MAX_HTTP_REQUEST_BODY_BYTES:
+                        raise RequestBodyTooLarge(
+                            f"Request body exceeds {MAX_HTTP_REQUEST_BODY_BYTES} bytes"
+                        )
+                return message
+
+            try:
+                await sse.handle_post_message(scope, receive_bounded, send)
+            except RequestBodyTooLarge:
+                response = JSONResponse(
+                    {"error": "Request body too large"}, status_code=413
+                )
+                await response(scope, receive, send)
 
         starlette_app = Starlette(
             debug=self.settings.sse_server_debug,
@@ -912,6 +972,7 @@ class MultiMCP:
             host=self.settings.host,
             port=self.settings.port,
             log_level=self.settings.log_level.lower(),
+            limit_concurrency=MAX_CONCURRENT_HTTP_REQUESTS,
         )
         server = uvicorn.Server(config)
         await server.serve()
@@ -927,10 +988,18 @@ class MultiMCP:
 
         elif method == "POST":
             try:
-                payload = await request.json()
-            except json.JSONDecodeError:
+                payload = await _read_bounded_json(request)
+            except RequestBodyTooLarge:
+                return JSONResponse(
+                    {"error": "Request body too large"}, status_code=413
+                )
+            except (json.JSONDecodeError, UnicodeDecodeError):
                 return JSONResponse(
                     {"error": "Invalid JSON in request body"}, status_code=400
+                )
+            if not isinstance(payload, dict):
+                return JSONResponse(
+                    {"error": "JSON request body must be an object"}, status_code=400
                 )
             if "mcpServers" not in payload:
                 return JSONResponse(
@@ -941,7 +1010,15 @@ class MultiMCP:
             # Static config servers (from --config or YAML) bypass this check since
             # the user explicitly authored those URLs.
             servers = payload.get("mcpServers", {})
-            added = []
+            if not isinstance(servers, dict) or any(
+                not isinstance(name, str) or not isinstance(config, dict)
+                for name, config in servers.items()
+            ):
+                return JSONResponse(
+                    {"error": "'mcpServers' must map server names to objects"},
+                    status_code=422,
+                )
+
             for name, config in servers.items():
                 url = config.get("url")
                 if url:
@@ -952,13 +1029,40 @@ class MultiMCP:
                             f"⚠️ Rejected /mcp_servers POST — SSRF check failed for '{name}': {ssrf_err}"
                         )
                         return JSONResponse({"error": str(ssrf_err)}, status_code=403)
-                self.proxy.client_manager.add_pending_server(name, config)
-                added.append(name)
 
-            if not added:
+            if not servers:
                 return JSONResponse(
                     {"error": "No servers found in payload"}, status_code=400
                 )
+
+            # Keep the capacity check and registry mutation atomic across
+            # concurrent management requests so the retained-state cap cannot
+            # be crossed by racing additions.
+            async with self.proxy._register_lock:
+                configured_names = (
+                    set(self.proxy.client_manager.clients)
+                    | set(self.proxy.client_manager.pending_configs)
+                    | set(self.proxy.client_manager.server_configs)
+                )
+                new_names = set(servers) - configured_names
+                if (
+                    len(configured_names) + len(new_names)
+                    > MAX_CONFIGURED_BACKENDS
+                ):
+                    return JSONResponse(
+                        {
+                            "error": (
+                                "Backend limit reached; remove a server before "
+                                f"adding more than {MAX_CONFIGURED_BACKENDS}"
+                            )
+                        },
+                        status_code=429,
+                    )
+
+                for name, config in servers.items():
+                    self.proxy.client_manager.add_pending_server(name, config)
+
+            added = list(servers)
 
             # Try to eagerly connect new servers for immediate availability
             try:
@@ -1061,10 +1165,18 @@ class MultiMCP:
         """Handle POST /mcp_control for manual server enable/disable."""
         try:
             try:
-                payload = await request.json()
-            except json.JSONDecodeError:
+                payload = await _read_bounded_json(request)
+            except RequestBodyTooLarge:
+                return JSONResponse(
+                    {"error": "Request body too large"}, status_code=413
+                )
+            except (json.JSONDecodeError, UnicodeDecodeError):
                 return JSONResponse(
                     {"error": "Invalid JSON in request body"}, status_code=400
+                )
+            if not isinstance(payload, dict):
+                return JSONResponse(
+                    {"error": "JSON request body must be an object"}, status_code=400
                 )
             action = payload.get("action")
             server_name = payload.get("server")

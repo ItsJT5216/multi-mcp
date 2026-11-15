@@ -15,7 +15,11 @@ from src.multimcp.mcp_client import (
     _filter_env,
     PROTECTED_ENV_VARS,
 )
-from src.multimcp.multi_mcp import MultiMCP
+from src.multimcp.multi_mcp import (
+    MAX_CONFIGURED_BACKENDS,
+    MAX_HTTP_REQUEST_BODY_BYTES,
+    MultiMCP,
+)
 from src.multimcp.mcp_proxy import MCPProxyServer
 from src.multimcp.mcp_client import MCPClientManager
 
@@ -205,6 +209,48 @@ class TestApiErrorResponses:
         assert response.status_code == 422
         body = response.json()
         assert "error" in body
+
+    @pytest.mark.asyncio
+    async def test_oversized_management_body_returns_413(self, app_no_debug):
+        """Management JSON is rejected before an oversized body is parsed."""
+        client = TestClient(app_no_debug.create_starlette_app())
+        response = client.post(
+            "/mcp_servers",
+            content=b"x" * (MAX_HTTP_REQUEST_BODY_BYTES + 1),
+            headers={"Content-Type": "application/json"},
+        )
+        assert response.status_code == 413
+
+    @pytest.mark.asyncio
+    async def test_oversized_mcp_message_returns_413(self, app_no_debug):
+        """The SSE message ingress rejects oversized arguments before dispatch."""
+        client = TestClient(app_no_debug.create_starlette_app())
+        response = client.post(
+            "/messages/test-session",
+            content=b"x" * (MAX_HTTP_REQUEST_BODY_BYTES + 1),
+            headers={"Content-Type": "application/json"},
+        )
+        assert response.status_code == 413
+
+    @pytest.mark.asyncio
+    async def test_dynamic_backend_limit_returns_429(self, app_no_debug):
+        """Repeated management requests cannot grow retained backend state forever."""
+        manager = app_no_debug.proxy.client_manager
+        manager.pending_configs.update(
+            {
+                f"server-{index}": {"command": "echo"}
+                for index in range(MAX_CONFIGURED_BACKENDS)
+            }
+        )
+        client = TestClient(app_no_debug.create_starlette_app())
+
+        response = client.post(
+            "/mcp_servers",
+            json={"mcpServers": {"one-too-many": {"command": "echo"}}},
+        )
+
+        assert response.status_code == 429
+        assert "one-too-many" not in manager.pending_configs
 
     @pytest.mark.asyncio
     async def test_error_detail_hidden_when_debug_false(self, app_no_debug):

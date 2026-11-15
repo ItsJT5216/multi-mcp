@@ -83,7 +83,9 @@ servers:
     url: https://mcp.exa.ai/mcp?tools=web_search_exa,get_code_context_exa
     always_on: false          # lazy: connects only when called
     idle_timeout_minutes: 5
-    tool_call_timeout_seconds: 60   # optional: fail hung tool calls after 60s
+    operation_timeout_seconds: 30   # deadline for every backend operation
+    tool_call_timeout_seconds: 60   # optional tool-specific override
+    max_catalog_items: 1000         # cap each backend capability catalog
     tools:
       web_search_exa:
         enabled: true
@@ -108,7 +110,7 @@ servers:
 
 To disable a tool, just set `enabled: false` and save. Takes effect on next `multi-mcp start`.
 
-**Per-server timeouts:** set `tool_call_timeout_seconds` on a server to bound how long a tool call may take. When unset (default), calls wait indefinitely. When set, a hung backend returns a timeout error instead of stalling the request, and repeated timeouts trip the proxy's circuit breaker (auto-quarantine after 3 consecutive failures).
+**Per-server resource limits:** every backend operation has a finite 30-second deadline by default. Set `operation_timeout_seconds` to tune it for a server, or `tool_call_timeout_seconds` for a tool-call-specific override. `max_catalog_items` limits each tools, prompts, or resources catalog to 1,000 entries by default. The runtime management API accepts at most 100 configured backends. Hung tool calls return an error, and repeated timeouts trip the proxy's circuit breaker (auto-quarantine after 3 consecutive failures).
 
 ---
 
