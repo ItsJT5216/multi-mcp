@@ -659,8 +659,10 @@ async def run_all() -> int:
 
     with tempfile.TemporaryDirectory() as tmpdir8:
         mm_mod.YAML_CONFIG_PATH = Path(tmpdir8) / "servers.yaml"
+        management_key8 = "runtime-check-management-key"
+        management_headers8 = {"Authorization": f"Bearer {management_key8}"}
         srv8 = MultiMCP(transport="sse", host="127.0.0.1", port=18097,
-                        config=str(test_cfg8))
+                        config=str(test_cfg8), management_api_key=management_key8)
         task8 = asyncio.create_task(srv8.run())
         await asyncio.sleep(5)
 
@@ -683,14 +685,18 @@ async def run_all() -> int:
                       "runtime_calc" not in all8_initial, str(body))
 
                 # POST the calculator backend
-                add_r = await hc.post("http://127.0.0.1:18097/mcp_servers", json={
-                    "mcpServers": {
-                        "runtime_calc": {
-                            "command": "python3",
-                            "args": [calc_path],
+                add_r = await hc.post(
+                    "http://127.0.0.1:18097/mcp_servers",
+                    headers=management_headers8,
+                    json={
+                        "mcpServers": {
+                            "runtime_calc": {
+                                "command": "python3",
+                                "args": [calc_path],
+                            }
                         }
-                    }
-                })
+                    },
+                )
                 check("POST /mcp_servers returns 2xx",
                       200 <= add_r.status_code < 300, str(add_r.status_code))
                 await asyncio.sleep(2)  # Let connection establish
@@ -710,7 +716,10 @@ async def run_all() -> int:
                       str(tools_body))
 
                 # DELETE the server
-                del_r = await hc.delete("http://127.0.0.1:18097/mcp_servers/runtime_calc")
+                del_r = await hc.delete(
+                    "http://127.0.0.1:18097/mcp_servers/runtime_calc",
+                    headers=management_headers8,
+                )
                 check("DELETE /mcp_servers returns 2xx",
                       200 <= del_r.status_code < 300, str(del_r.status_code))
                 await asyncio.sleep(1)
@@ -840,6 +849,7 @@ if __name__ == "__main__":
         mm_mod.YAML_CONFIG_PATH = Path(tmpdir11) / "servers.yaml"
         srv11 = MultiMCP(transport="sse", host="127.0.0.1", port=18096,
                          api_key="super-secret-test-key",
+                         management_api_key="super-secret-management-key",
                          config=str(test_cfg11))
         task11 = asyncio.create_task(srv11.run())
         await asyncio.sleep(5)
@@ -875,7 +885,7 @@ if __name__ == "__main__":
                 # POST with correct auth
                 r5 = await hc.post("http://127.0.0.1:18096/mcp_servers",
                                     json={"mcpServers": {}},
-                                    headers={"Authorization": "Bearer super-secret-test-key"})
+                                    headers={"Authorization": "Bearer super-secret-management-key"})
                 check("POST with correct key → not 401", r5.status_code != 401, str(r5.status_code))
 
           except Exception as e:

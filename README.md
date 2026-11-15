@@ -33,7 +33,7 @@ Most MCP setups require configuring every server individually in every tool (Cla
 - **Tool namespacing** — `server::tool_name` prevents conflicts across servers
 - **Runtime HTTP API** — add/remove servers without restarting (SSE mode)
 - **Audit logging** — JSONL log of every tool call
-- **API key auth** — optional Bearer token for SSE mode
+- **Scoped API key auth** — client and operator Bearer tokens for SSE mode
 
 ---
 
@@ -119,7 +119,7 @@ To disable a tool, just set `enabled: false` and save. Takes effect on next `mul
 uv run python main.py start
 
 # Start in SSE mode (network accessible)
-uv run python main.py start --transport sse --port 8085
+MULTI_MCP_API_KEY=client-secret uv run python main.py start --transport sse --port 8085
 
 # Re-discover tools from all servers, smart-merge into YAML
 uv run python main.py refresh
@@ -189,7 +189,9 @@ For `url`-based servers, multi-mcp tries Streamable HTTP first and falls back to
 
 ## Runtime API (SSE mode)
 
-When running with `--transport sse`, a management API is available:
+When running with `--transport sse`, read-only HTTP endpoints use the client
+credential. Mutating management endpoints are disabled unless a distinct
+`MULTI_MCP_MANAGEMENT_API_KEY` is configured:
 
 ```bash
 # List active servers
@@ -209,7 +211,19 @@ GET /mcp_tools
 GET /health
 ```
 
-Authenticate with `Authorization: Bearer <key>` (set `MULTI_MCP_API_KEY` env var to enable).
+Authenticate read-only and MCP requests with `Authorization: Bearer <client-key>`.
+Use `Authorization: Bearer <management-key>` only for `POST /mcp_servers`,
+`DELETE /mcp_servers/{name}`, and `POST /mcp_control`. The two keys must differ.
+Non-loopback SSE binds fail at startup without `MULTI_MCP_API_KEY`; the explicit
+`--allow-unauthenticated-network` escape hatch is intended only for isolated deployments.
+
+The Kubernetes example expects the client value in a required Secret, leaves
+mutating management disabled, and exposes a cluster-internal service:
+
+```bash
+kubectl create secret generic multi-mcp-auth \
+  --from-literal=api-key='client-secret'
+```
 
 ---
 
@@ -272,6 +286,8 @@ uv run python main.py list
 | Variable | Description |
 |----------|-------------|
 | `MULTI_MCP_API_KEY` | Bearer token for SSE API auth |
+| `MULTI_MCP_MANAGEMENT_API_KEY` | Distinct Bearer token enabling mutating management routes |
+| `MULTI_MCP_ALLOW_UNAUTHENTICATED_NETWORK` | Explicitly allow an unsafe non-loopback SSE bind |
 | `MULTI_MCP_HOST` | SSE bind host (default: `127.0.0.1`) |
 | `MULTI_MCP_PORT` | SSE bind port (default: `8085`) |
 | `MULTI_MCP_LOG_LEVEL` | Log level: DEBUG, INFO, WARNING, ERROR |

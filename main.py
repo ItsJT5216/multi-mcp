@@ -1,6 +1,7 @@
 import asyncio
 import anyio
 import argparse
+import os
 from pathlib import Path
 from src.multimcp.multi_mcp import MultiMCP
 from src.multimcp.cli import cmd_list, cmd_status, cmd_refresh, DEFAULT_YAML
@@ -19,7 +20,23 @@ def parse_args():
         "--config", type=str, default=None,
         help="Path to MCP JSON config. If omitted, auto-discovers from Claude plugins and YAML sources."
     )
-    start.add_argument("--api-key", type=str, default=None)
+    start.add_argument(
+        "--api-key", type=str, default=os.environ.get("MULTI_MCP_API_KEY")
+    )
+    start.add_argument(
+        "--management-api-key",
+        type=str,
+        default=os.environ.get("MULTI_MCP_MANAGEMENT_API_KEY"),
+        help="Distinct Bearer token for mutating management endpoints",
+    )
+    start.add_argument(
+        "--allow-unauthenticated-network",
+        action="store_true",
+        default=os.environ.get(
+            "MULTI_MCP_ALLOW_UNAUTHENTICATED_NETWORK", ""
+        ).strip().lower() in {"1", "true", "yes", "on"},
+        help="Allow an unauthenticated non-loopback SSE bind (unsafe)",
+    )
     start.add_argument(
         "--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"], default="INFO"
     )
@@ -54,6 +71,8 @@ if __name__ == "__main__":
             port=args.port,
             log_level=args.log_level,
             api_key=args.api_key,
+            management_api_key=args.management_api_key,
+            allow_unauthenticated_network=args.allow_unauthenticated_network,
             profile=args.profile,
         )
         asyncio.run(server.run())

@@ -36,6 +36,8 @@ def _find_free_port() -> int:
 
 CONFIG_A = str(REPO_ROOT / "examples" / "config" / "mcp.json")
 RETRIEVAL_HELPER = str(REPO_ROOT / "tests" / "tools" / "retrieval_server.py")
+MANAGEMENT_API_KEY = "live-test-management-key"
+MANAGEMENT_HEADERS = {"Authorization": f"Bearer {MANAGEMENT_API_KEY}"}
 
 
 # ─── helpers ──────────────────────────────────────────────────────────────────
@@ -90,6 +92,7 @@ def scenario_a_proc():
             "--host", "127.0.0.1",
             "--port", str(port),
             "--config", CONFIG_A,
+            "--management-api-key", MANAGEMENT_API_KEY,
         ],
         cwd=str(REPO_ROOT),
     )
@@ -188,6 +191,7 @@ class TestScenarioA:
             r = await client.post(
                 f"http://127.0.0.1:{scenario_a}/mcp_servers",
                 json=payload,
+                headers=MANAGEMENT_HEADERS,
                 timeout=15.0,
             )
         assert r.status_code == 200, f"POST /mcp_servers failed: {r.status_code} {r.text}"
@@ -219,6 +223,7 @@ class TestScenarioA:
         async with httpx.AsyncClient() as client:
             r3 = await client.delete(
                 f"http://127.0.0.1:{scenario_a}/mcp_servers/unit_convertor",
+                headers=MANAGEMENT_HEADERS,
                 timeout=10.0,
             )
         assert r3.status_code == 200, f"DELETE /mcp_servers/unit_convertor failed: {r3.status_code} {r3.text}"

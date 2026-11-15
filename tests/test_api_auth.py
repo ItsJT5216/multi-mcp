@@ -15,12 +15,20 @@ from src.multimcp.mcp_proxy import MCPProxyServer
 from src.multimcp.mcp_client import MCPClientManager
 
 
+CLIENT_API_KEY = "test-secret-key-12345"
+MANAGEMENT_API_KEY = "test-management-key-67890"
+
+
 @pytest_asyncio.fixture
 async def auth_app():
     """Create MultiMCP app with auth enabled."""
     # Create app with API key auth enabled
     app = MultiMCP(
-        transport="sse", host="127.0.0.1", port=8085, api_key="test-secret-key-12345"
+        transport="sse",
+        host="127.0.0.1",
+        port=8085,
+        api_key=CLIENT_API_KEY,
+        management_api_key=MANAGEMENT_API_KEY,
     )
 
     # Mock client manager and proxy
@@ -62,7 +70,7 @@ class TestHTTPEndpointAuth:
 
         # Request with valid auth header
         response = client.get(
-            "/health", headers={"Authorization": "Bearer test-secret-key-12345"}
+            "/health", headers={"Authorization": f"Bearer {CLIENT_API_KEY}"}
         )
         assert response.status_code == 200
         assert "status" in response.json()
@@ -118,6 +126,45 @@ class TestHTTPEndpointAuth:
 
         response = client.delete("/mcp_servers/test")
         assert response.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_client_token_cannot_mutate_servers(self, auth_app):
+        """The ordinary MCP client credential must not authorize server creation."""
+        client = TestClient(auth_app.create_starlette_app())
+
+        response = client.post(
+            "/mcp_servers",
+            headers={"Authorization": f"Bearer {CLIENT_API_KEY}"},
+            json={"mcpServers": {}},
+        )
+        assert response.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_management_token_reaches_handler(self, auth_app):
+        """The distinct operator credential preserves authenticated management."""
+        client = TestClient(auth_app.create_starlette_app())
+
+        response = client.post(
+            "/mcp_servers",
+            headers={"Authorization": f"Bearer {MANAGEMENT_API_KEY}"},
+            json={"mcpServers": {}},
+        )
+        assert response.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_management_disabled_without_key(self, no_auth_app):
+        """Mutating routes fail closed when no management credential is configured."""
+        client = TestClient(no_auth_app.create_starlette_app())
+
+        response = client.post(
+            "/mcp_servers",
+            json={
+                "mcpServers": {
+                    "attacker": {"command": "sh", "args": ["-c", "id"]}
+                }
+            },
+        )
+        assert response.status_code == 403
 
 
 class TestSSEAuthQueryParam:
@@ -219,6 +266,40 @@ class TestAuthConfiguration:
         app = MultiMCP()
         assert app.settings.api_key is None
 
+    def test_management_api_key_from_env_var(self, monkeypatch):
+        """Operator auth should load from MULTI_MCP_MANAGEMENT_API_KEY."""
+        monkeypatch.setenv("MULTI_MCP_MANAGEMENT_API_KEY", "operator-secret")
+        app = MultiMCP()
+        assert app.settings.management_api_key == "operator-secret"
+
+    def test_management_key_must_be_distinct(self):
+        """Client credentials cannot be reused to gain management privileges."""
+        with pytest.raises(ValueError, match="must differ"):
+            MultiMCP(
+                transport="sse",
+                api_key="shared-secret",
+                management_api_key="shared-secret",
+            )
+
+    def test_non_loopback_sse_requires_client_key(self):
+        """Externally bound SSE servers must reject missing client authentication."""
+        with pytest.raises(ValueError, match="require MULTI_MCP_API_KEY"):
+            MultiMCP(transport="sse", host="0.0.0.0")
+
+    def test_loopback_sse_remains_available_without_client_key(self):
+        """Local SSE development remains available without network authentication."""
+        app = MultiMCP(transport="sse", host="127.0.0.1")
+        assert app.auth_enabled is False
+
+    def test_explicit_network_escape_hatch(self):
+        """Explicitly isolated deployments may opt into unauthenticated network binds."""
+        app = MultiMCP(
+            transport="sse",
+            host="0.0.0.0",
+            allow_unauthenticated_network=True,
+        )
+        assert app.auth_enabled is False
+
     def test_auth_enabled_property(self):
         """Should have property to check if auth is enabled."""
         app_with_auth = MultiMCP(api_key="secret")
@@ -247,7 +328,7 @@ class TestAuthMiddleware:
 
         # Missing 'Bearer' prefix
         response = client.get(
-            "/health", headers={"Authorization": "test-secret-key-12345"}
+            "/health", headers={"Authorization": CLIENT_API_KEY}
         )
         assert response.status_code == 401
 
