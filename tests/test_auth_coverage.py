@@ -365,3 +365,71 @@ class TestAuthDisabled:
         result = app._check_auth(request)
         # Auth disabled — _check_auth always returns None (no 401)
         assert result is None
+
+
+class TestNonAsciiAuth:
+    """Untrusted Unicode credentials must be rejected before backend work."""
+
+    @pytest.mark.parametrize("token", [b"\xff", b"\xc3\xa9"])
+    @pytest.mark.parametrize(
+        ("method", "path"),
+        [
+            ("GET", "/health"),
+            ("GET", "/mcp_servers"),
+            ("GET", "/mcp_tools"),
+            ("GET", "/sse"),
+            ("POST", "/messages/"),
+            ("POST", "/mcp_servers"),
+            ("DELETE", "/mcp_servers/blocked"),
+            ("POST", "/mcp_control"),
+        ],
+    )
+    def test_non_ascii_bearer_rejected_before_backend_work(self, token, method, path):
+        app = _build_app_with_auth()
+        proxy = MagicMock()
+        app.proxy = proxy
+        client = TestClient(app.create_starlette_app(), raise_server_exceptions=False)
+
+        with patch.object(Request, "json", new_callable=AsyncMock) as read_json:
+            response = client.request(
+                method,
+                path,
+                headers={b"authorization": b"Bearer " + token},
+                content=b'{"mcpServers":{"blocked":{"command":"python3"}}}',
+            )
+
+        assert response.status_code == 401
+        assert "error" in response.json()
+        read_json.assert_not_awaited()
+        assert proxy.mock_calls == []
+
+    @pytest.mark.parametrize("token", ["%C3%A9", "%FF", "%F0%9F%94%91"])
+    def test_non_ascii_sse_query_rejected_before_backend_work(self, token):
+        app = _build_app_with_auth()
+        proxy = MagicMock()
+        app.proxy = proxy
+        client = TestClient(app.create_starlette_app(), raise_server_exceptions=False)
+
+        response = client.get(f"/sse?token={token}")
+
+        assert response.status_code == 401
+        assert "error" in response.json()
+        assert proxy.mock_calls == []
+
+    def test_distinct_non_ascii_keys_allow_startup(self):
+        app = MultiMCP(
+            transport="sse",
+            api_key="client-\u00e9",
+            management_api_key="operator-\u00e9",
+        )
+
+        assert app.auth_enabled
+        assert app.management_auth_enabled
+
+    def test_identical_non_ascii_keys_are_rejected(self):
+        with pytest.raises(ValueError, match="must differ"):
+            MultiMCP(
+                transport="sse",
+                api_key="shared-\u00e9",
+                management_api_key="shared-\u00e9",
+            )

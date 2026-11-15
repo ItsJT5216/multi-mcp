@@ -105,7 +105,8 @@ class MultiMCP:
             and self.auth_enabled
             and self.management_auth_enabled
             and hmac.compare_digest(
-                self.settings.api_key, self.settings.management_api_key
+                self.settings.api_key.encode("utf-8"),
+                self.settings.management_api_key.encode("utf-8"),
             )
         ):
             raise ValueError(
@@ -806,14 +807,18 @@ class MultiMCP:
                     status_code=401,
                 )
             token = auth_header[7:]  # Remove "Bearer " prefix
-            if hmac.compare_digest(token, self.settings.api_key):
+            if hmac.compare_digest(
+                token.encode("utf-8"), self.settings.api_key.encode("utf-8")
+            ):
                 return None  # Valid token
             return JSONResponse({"error": "Unauthorized: Invalid API key"}, status_code=401)
 
         # Deprecated fallback: query parameter for SSE endpoint
         if request.url.path == "/sse":
             token = request.query_params.get("token")
-            if token and hmac.compare_digest(token, self.settings.api_key):
+            if token and hmac.compare_digest(
+                token.encode("utf-8"), self.settings.api_key.encode("utf-8")
+            ):
                 self.logger.warning(
                     "⚠️ SSE auth via query parameter is deprecated. Use 'Authorization: Bearer <token>' header instead."
                 )
@@ -859,7 +864,9 @@ class MultiMCP:
 
         token = auth_header[7:]
         management_api_key = self.settings.management_api_key
-        if management_api_key and hmac.compare_digest(token, management_api_key):
+        if management_api_key and hmac.compare_digest(
+            token.encode("utf-8"), management_api_key.encode("utf-8")
+        ):
             return None
         return JSONResponse(
             {"error": "Unauthorized: Invalid management API key"}, status_code=401
