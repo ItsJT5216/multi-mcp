@@ -193,6 +193,7 @@ class MCPClientManager:
         self._supervision_tasks: Dict[str, asyncio.Task] = {}
         self._lifecycle_tasks: Dict[str, asyncio.Task] = {}
         self._shutdown_events: Dict[str, asyncio.Event] = {}
+        self._silent_lifecycle_stops: Set[str] = set()
         # Per-server backoff state for watchdog reconnects
         self._reconnect_backoff: Dict[str, float] = {}
 
@@ -201,7 +202,7 @@ class MCPClientManager:
         return self._creation_locks.setdefault(name, asyncio.Lock())
 
     def cleanup_server_state(self, name: str) -> None:
-        """Remove all per-server state for a fully unregistered server."""
+        """Remove configuration state after a server lifecycle has stopped."""
         self.pending_configs.pop(name, None)
         self.server_configs.pop(name, None)
         self.tool_filters.pop(name, None)
@@ -209,11 +210,8 @@ class MCPClientManager:
         self.last_used.pop(name, None)
         self._creation_locks.pop(name, None)
         self._reconnect_backoff.pop(name, None)
-        self.clients.pop(name, None)
-        task = self._supervision_tasks.pop(name, None)
-        if task and not task.done():
-            task.cancel()
-        self.server_stacks.pop(name, None)
+        self._silent_lifecycle_stops.discard(name)
+        self.always_on_servers.discard(name)
 
     # ── Transport negotiation (deduplicated) ───────────────────────────
 
@@ -428,6 +426,20 @@ class MCPClientManager:
         self.pending_configs[name] = config
         self.logger.info(f"📋 Added pending server: {name}")
 
+    async def _create_client_with_timeout(self, name: str, config: dict) -> None:
+        """Create one client under the shared concurrency and timeout controls."""
+        async with self._connection_semaphore:
+            try:
+                await asyncio.wait_for(
+                    self._create_single_client(name, config),
+                    timeout=self._connection_timeout,
+                )
+            except BaseException:
+                # wait_for cancels only _create_single_client; its independently
+                # spawned lifecycle task must be stopped explicitly.
+                await self._reset_failed_server(name)
+                raise
+
     async def get_or_create_client(self, name: str) -> ClientSession:
         """Get an existing client or create it from pending configs on first access.
 
@@ -446,19 +458,15 @@ class MCPClientManager:
 
             if name in self.pending_configs:
                 config = self.pending_configs.pop(name)
-                async with self._connection_semaphore:
-                    try:
-                        await asyncio.wait_for(
-                            self._create_single_client(name, config),
-                            timeout=self._connection_timeout,
-                        )
-                    except asyncio.TimeoutError:
-                        self.pending_configs[name] = config
-                        self.logger.error(f"❌ Connection timeout for {name}")
-                        raise
-                    except Exception:
-                        self.pending_configs[name] = config
-                        raise
+                try:
+                    await self._create_client_with_timeout(name, config)
+                except asyncio.TimeoutError:
+                    self.pending_configs[name] = config
+                    self.logger.error(f"❌ Connection timeout for {name}")
+                    raise
+                except BaseException:
+                    self.pending_configs[name] = config
+                    raise
                 self.record_usage(name)
                 return self.clients[name]
 
@@ -482,8 +490,11 @@ class MCPClientManager:
 
         async def _lifecycle() -> None:
             server_stack = AsyncExitStack()
-            await server_stack.__aenter__()
             try:
+                await server_stack.__aenter__()
+                # Publish the stack before opening a transport so timeout and
+                # initialization failures can always reach partial resources.
+                self.server_stacks[name] = server_stack
                 command = server.get("command")
                 url = server.get("url")
                 args = server.get("args", [])
@@ -514,7 +525,6 @@ class MCPClientManager:
                     return
 
                 self.clients[name] = session
-                self.server_stacks[name] = server_stack
                 self.logger.info(f"✅ Connected to {name}")
                 ready_event.set()
 
@@ -531,19 +541,28 @@ class MCPClientManager:
                     f"🔌 Server '{name}' disconnected: {type(exc).__name__}: {exc}"
                 )
             finally:
-                self.clients.pop(name, None)
-                self.server_stacks.pop(name, None)
-                self._shutdown_events.pop(name, None)
+                current_task = asyncio.current_task()
+                notify_disconnected = name not in self._silent_lifecycle_stops
                 try:
-                    await server_stack.aclose()
-                except Exception:
-                    pass
-                if ready_event.is_set() and not error_holder:
-                    if self._on_server_disconnected:
-                        try:
-                            await self._on_server_disconnected(name)
-                        except Exception:
-                            pass
+                    self.clients.pop(name, None)
+                    if self._shutdown_events.get(name) is shutdown_event:
+                        self._shutdown_events.pop(name, None)
+                    try:
+                        await server_stack.aclose()
+                    except Exception:
+                        pass
+                    if notify_disconnected and ready_event.is_set() and not error_holder:
+                        if self._on_server_disconnected:
+                            try:
+                                await self._on_server_disconnected(name)
+                            except Exception:
+                                pass
+                finally:
+                    if self.server_stacks.get(name) is server_stack:
+                        self.server_stacks.pop(name, None)
+                    if self._lifecycle_tasks.get(name) is current_task:
+                        self._lifecycle_tasks.pop(name, None)
+                    self._silent_lifecycle_stops.discard(name)
 
         task = asyncio.create_task(_lifecycle(), name=f"lifecycle-{name}")
         self._lifecycle_tasks[name] = task
@@ -552,24 +571,76 @@ class MCPClientManager:
         if error_holder:
             raise error_holder[0]
 
-    async def _stop_server_lifecycle(self, name: str) -> None:
-        """Signal a server's lifecycle task to shut down and wait for it."""
+    async def _stop_server_lifecycle(
+        self, name: str, *, notify_disconnected: bool = True
+    ) -> None:
+        """Idempotently stop and remove every runtime resource for a server."""
+        if not notify_disconnected:
+            self._silent_lifecycle_stops.add(name)
+
+        stack = self.server_stacks.get(name)
         evt = self._shutdown_events.pop(name, None)
         if evt:
             evt.set()
+        # Make the session unavailable before cancelling supervision so its
+        # cleanup path cannot race an intentional teardown callback.
+        self.clients.pop(name, None)
+
         sup = self._supervision_tasks.pop(name, None)
-        if sup and not sup.done():
-            sup.cancel()
-        task = self._lifecycle_tasks.pop(name, None)
-        if task and not task.done():
+        current_task = asyncio.current_task()
+        if sup and sup is not current_task:
+            if not sup.done():
+                sup.cancel()
             try:
-                await asyncio.wait_for(task, timeout=5.0)
-            except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
-                task.cancel()
+                await sup
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        task = self._lifecycle_tasks.pop(name, None)
+        if task and task is not current_task:
+            if not task.done():
+                if not notify_disconnected:
+                    task.cancel()
                 try:
-                    await task
+                    await asyncio.wait_for(asyncio.shield(task), timeout=5.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                    task.cancel()
+                    try:
+                        await task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+            else:
+                try:
+                    task.result()
                 except (asyncio.CancelledError, Exception):
                     pass
+
+        # The lifecycle normally closes its own stack. This fallback handles
+        # partial startup, already-finished tasks, and legacy stack-only state.
+        remaining_stack = self.server_stacks.pop(name, None)
+        if remaining_stack is None and (task is None or task.cancelled()):
+            remaining_stack = stack
+        if remaining_stack:
+            try:
+                await remaining_stack.aclose()
+            except Exception as exc:
+                self.logger.warning(f"⚠️ Error closing stack for '{name}': {exc}")
+
+        self.clients.pop(name, None)
+        self._shutdown_events.pop(name, None)
+        self._lifecycle_tasks.pop(name, None)
+        self._silent_lifecycle_stops.discard(name)
+
+    async def _reset_failed_server(
+        self, name: str, *, notify_disconnected: bool = True
+    ) -> None:
+        """Release a failed runtime while preserving its configuration for retry."""
+        await self._stop_server_lifecycle(
+            name, notify_disconnected=notify_disconnected
+        )
+        config = self.server_configs.get(name)
+        if config is not None:
+            self.pending_configs[name] = config
 
     # ── Idle management ────────────────────────────────────────────────
 
@@ -588,17 +659,11 @@ class MCPClientManager:
         ]
         for name in to_disconnect:
             self.logger.info(f"💤 Disconnecting idle server: {name}")
-            del self.clients[name]
             if name in self.server_configs:
                 self.pending_configs[name] = self.server_configs[name]
             self.last_used.pop(name, None)
             self._creation_locks.pop(name, None)
-            stack = self.server_stacks.pop(name, None)
-            if stack:
-                try:
-                    await stack.aclose()
-                except Exception as e:
-                    self.logger.warning(f"⚠️ Error closing stack for '{name}': {e}")
+            await self._stop_server_lifecycle(name, notify_disconnected=False)
             if self._on_server_disconnected:
                 try:
                     await self._on_server_disconnected(name)
@@ -647,10 +712,7 @@ class MCPClientManager:
 
                 self.logger.warning(f"⚠️ Always-on server '{name}' disconnected — reconnecting...")
                 try:
-                    await asyncio.wait_for(
-                        self._create_single_client(name, server_config),
-                        timeout=self._connection_timeout,
-                    )
+                    await self._create_client_with_timeout(name, server_config)
                     client = self.clients.get(name)
                     if client:
                         await asyncio.wait_for(
@@ -667,6 +729,7 @@ class MCPClientManager:
                                     f"⚠️ on_server_reconnected callback failed for '{name}': {cb_err}"
                                 )
                 except Exception as e:
+                    await self._reset_failed_server(name)
                     # Compute next backoff with jitter
                     prev = self._reconnect_backoff.get(name, _BACKOFF_BASE / 2)
                     next_backoff = min(prev * 2, _BACKOFF_CAP)
@@ -718,8 +781,9 @@ class MCPClientManager:
             finally:
                 if name in self.clients:
                     self.logger.info(f"🔄 Cleaning up '{name}' for watchdog reconnect")
-                    self.clients.pop(name, None)
-                    self.server_stacks.pop(name, None)
+                    await self._stop_server_lifecycle(
+                        name, notify_disconnected=False
+                    )
                     if self._on_server_disconnected:
                         try:
                             await self._on_server_disconnected(name)
@@ -760,7 +824,7 @@ class MCPClientManager:
                 self.logger.warning(
                     f"⚠️ Client '{name}' already exists and will be overridden."
                 )
-            await self._create_single_client(name, server)
+            await self._create_client_with_timeout(name, server)
 
         return self.clients
 
@@ -768,41 +832,20 @@ class MCPClientManager:
 
     async def close(self) -> None:
         """Closes all clients and releases resources."""
-        # Signal all lifecycle tasks to shut down
-        for evt in list(self._shutdown_events.values()):
-            evt.set()
+        server_names = (
+            set(self.clients)
+            | set(self.server_stacks)
+            | set(self._shutdown_events)
+            | set(self._lifecycle_tasks)
+            | set(self._supervision_tasks)
+        )
+        for name in server_names:
+            await self._stop_server_lifecycle(name)
 
-        # Cancel supervision tasks
-        for task in list(self._supervision_tasks.values()):
-            if not task.done():
-                task.cancel()
-        for task in list(self._supervision_tasks.values()):
-            try:
-                await asyncio.wait_for(asyncio.shield(task), timeout=2.0)
-            except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
-                pass
         self._supervision_tasks.clear()
-
-        # Wait for lifecycle tasks
-        for task in list(self._lifecycle_tasks.values()):
-            if not task.done():
-                try:
-                    await asyncio.wait_for(task, timeout=5.0)
-                except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
-                    task.cancel()
-                    try:
-                        await task
-                    except (asyncio.CancelledError, Exception):
-                        pass
         self._lifecycle_tasks.clear()
         self._shutdown_events.clear()
-
-        # Close any stacks not managed by lifecycle tasks
-        for name, server_stack in list(self.server_stacks.items()):
-            try:
-                await server_stack.aclose()
-            except Exception as e:
-                self.logger.warning(f"⚠️ Error closing server stack for '{name}': {e}")
+        self._silent_lifecycle_stops.clear()
         self.server_stacks.clear()
         self.clients.clear()
         await self.stack.aclose()

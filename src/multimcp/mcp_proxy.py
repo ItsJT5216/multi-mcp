@@ -175,8 +175,9 @@ class MCPProxyServer(server.Server):
         # Remove failed clients so their broken sessions don't crash tool listing
         for name in results:
             if name is not None:
-                self.client_manager.clients.pop(name, None)
-                self.client_manager.server_stacks.pop(name, None)
+                await self.client_manager._reset_failed_server(name)
+                self.capabilities.pop(name, None)
+                self._reset_server_mappings(name)
 
     async def initialize_single_client(self, name: str, client: ClientSession) -> None:
         """Initialize a specific client and map its capabilities."""
@@ -228,8 +229,19 @@ class MCPProxyServer(server.Server):
         """Add a new client and register its capabilities."""
         async with self._register_lock:
             self.client_manager.clients[name] = client
-            # Re-fetch capabilities (like on startup)
-            await self.initialize_single_client(name, client)
+            try:
+                # Re-fetch capabilities (like on startup)
+                await self.initialize_single_client(name, client)
+            except BaseException:
+                # The lifecycle owns transports independently of registration.
+                # Suppress its callback while this lock removes partial state.
+                self.client_manager.clients.pop(name, None)
+                await self.client_manager._reset_failed_server(
+                    name, notify_disconnected=False
+                )
+                self.capabilities.pop(name, None)
+                self._reset_server_mappings(name)
+                raise
             # Send notifications for changed capabilities
             caps = self.capabilities.get(name)
             if caps and caps.tools:
@@ -240,6 +252,36 @@ class MCPProxyServer(server.Server):
                 await self._send_prompts_list_changed()
             if caps and caps.resources:
                 await self._send_resources_list_changed()
+
+    def _remove_server_mappings(self, name: str) -> None:
+        """Remove every proxy capability mapping owned by one server."""
+        self.tool_to_server = {
+            key: value
+            for key, value in self.tool_to_server.items()
+            if value.server_name != name
+        }
+        self.prompt_to_server = {
+            key: value
+            for key, value in self.prompt_to_server.items()
+            if value.server_name != name
+        }
+        self.resource_to_server = {
+            key: value
+            for key, value in self.resource_to_server.items()
+            if value.server_name != name
+        }
+
+    def _reset_server_mappings(self, name: str) -> None:
+        """Keep discoverable mappings retryable without retaining a live client."""
+        for mapping in self.tool_to_server.values():
+            if mapping.server_name == name:
+                mapping.client = None
+        for mapping in self.prompt_to_server.values():
+            if mapping.server_name == name:
+                mapping.client = None
+        for mapping in self.resource_to_server.values():
+            if mapping.server_name == name:
+                mapping.client = None
 
     async def unregister_client(self, name: str) -> None:
         """Remove a client and clean up all its associated mappings."""
@@ -254,33 +296,23 @@ class MCPProxyServer(server.Server):
             had_tools = caps and caps.tools if caps else False
 
             self.logger.info(f"🗑️ Unregistering client: {name}")
-            del self.client_manager.clients[name]
+            self.client_manager.clients.pop(name, None)
+            await self.client_manager._stop_server_lifecycle(
+                name, notify_disconnected=False
+            )
 
             self.capabilities.pop(name, None)
 
             # Fix: filter by server_name, not client identity.
             # After disconnect, client is set to None, so v.client != client
             # would be True (None != original_client), keeping ghost entries.
-            self.tool_to_server = {
-                k: v for k, v in self.tool_to_server.items() if v.server_name != name
-            }
-            self.prompt_to_server = {
-                k: v for k, v in self.prompt_to_server.items() if v.server_name != name
-            }
-            self.resource_to_server = {
-                k: v for k, v in self.resource_to_server.items() if v.server_name != name
-            }
+            self._remove_server_mappings(name)
 
             self.logger.info(f"✅ Client '{name}' fully unregistered.")
 
             # Clean up client manager runtime state for this server
             if self.client_manager:
-                self.client_manager.pending_configs.pop(name, None)
-                self.client_manager.server_configs.pop(name, None)
-                self.client_manager.tool_filters.pop(name, None)
-                self.client_manager.idle_timeouts.pop(name, None)
-                self.client_manager.last_used.pop(name, None)
-                self.client_manager._creation_locks.pop(name, None)
+                self.client_manager.cleanup_server_state(name)
 
             # Send notifications for removed capabilities
             if had_tools:
@@ -571,6 +603,9 @@ class MCPProxyServer(server.Server):
                     refresh_needed = True
                     self.logger.info(f"🔥 Auto-enabled server '{server_name}' via trigger")
                 except Exception as e:
+                    await self.client_manager._reset_failed_server(server_name)
+                    self.capabilities.pop(server_name, None)
+                    self._reset_server_mappings(server_name)
                     self.logger.warning(
                         f"⚠️ Trigger-enabled '{server_name}' failed to initialize: {e}"
                     )
@@ -592,6 +627,11 @@ class MCPProxyServer(server.Server):
                     await self._send_tools_list_changed()
                     tool_item = self.tool_to_server.get(tool_name)
                 except Exception as e:
+                    await self.client_manager._reset_failed_server(
+                        tool_item.server_name
+                    )
+                    self.capabilities.pop(tool_item.server_name, None)
+                    self._reset_server_mappings(tool_item.server_name)
                     return types.ServerResult(
                         content=[types.TextContent(type="text", text=f"Failed to connect server '{tool_item.server_name}': {e}")],
                         isError=True,
@@ -932,15 +972,7 @@ class MCPProxyServer(server.Server):
     async def _on_server_disconnected(self, server_name: str) -> None:
         """Reset tool, prompt, and resource mappings for a disconnected server and notify client."""
         async with self._register_lock:
-            for key, mapping in self.tool_to_server.items():
-                if mapping.server_name == server_name:
-                    mapping.client = None
-            for key, mapping in self.prompt_to_server.items():
-                if mapping.server_name == server_name:
-                    mapping.client = None
-            for key, mapping in self.resource_to_server.items():
-                if mapping.server_name == server_name:
-                    mapping.client = None
+            self._reset_server_mappings(server_name)
         await self._send_tools_list_changed()
         await self._send_prompts_list_changed()
         await self._send_resources_list_changed()

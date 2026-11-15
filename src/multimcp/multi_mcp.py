@@ -480,6 +480,13 @@ class MultiMCP:
         )
         return config
 
+    async def _reset_failed_backend(self, server_name: str) -> None:
+        """Release a failed initialized backend and retain its retry config."""
+        await self.client_manager._reset_failed_server(server_name)
+        if self.proxy:
+            self.proxy.capabilities.pop(server_name, None)
+            self.proxy._reset_server_mappings(server_name)
+
     async def _connect_always_on_servers(self, yaml_config: MultiMCPConfig) -> None:
         """Connect all always_on servers concurrently.
 
@@ -488,15 +495,19 @@ class MultiMCP:
         servers. Failures are isolated per server.
         """
         async def _connect_one(server_name: str) -> None:
+            initialized = False
             try:
                 client = await self.client_manager.get_or_create_client(server_name)
                 if self.proxy:
                     await self.proxy.initialize_single_client(server_name, client)
+                    initialized = True
                     if self.proxy.retrieval_pipeline is not None:
                         self.proxy.retrieval_pipeline.rebuild_catalog(self.proxy.tool_to_server)
                     await self.proxy._send_tools_list_changed()
                     self.logger.info(f"✅ Always-on server '{server_name}' connected")
             except Exception as e:
+                if not initialized:
+                    await self._reset_failed_backend(server_name)
                 self.logger.warning(f"⚠️ Always-on '{server_name}' failed to connect: {e}")
 
         await asyncio.gather(
@@ -519,6 +530,7 @@ class MultiMCP:
                 client = await self.client_manager.get_or_create_client(server_name)
                 await self.proxy.initialize_single_client(server_name, client)
             except Exception as e:
+                await self._reset_failed_backend(server_name)
                 self.logger.warning(
                     f"⚠️ Failed to connect '{server_name}' during JSON-config init: {e}"
                 )
@@ -692,6 +704,13 @@ class MultiMCP:
                 """Called by watchdog after reconnect — refresh proxy tool mappings."""
                 try:
                     await self.proxy.initialize_single_client(server_name, client)
+                except Exception as e:
+                    await self._reset_failed_backend(server_name)
+                    self.logger.warning(
+                        f"⚠️ Failed to initialize reconnected server '{server_name}': {e}"
+                    )
+                    return
+                try:
                     if self.proxy.retrieval_pipeline is not None:
                         self.proxy.retrieval_pipeline.rebuild_catalog(self.proxy.tool_to_server)
                     await self.proxy._send_tools_list_changed()
