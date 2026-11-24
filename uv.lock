@@ -754,6 +754,7 @@ version = "1.0.0"
 source = { virtual = "." }
 dependencies = [
     { name = "anyio" },
+    { name = "exceptiongroup", marker = "python_full_version < '3.11'" },
     { name = "httpx-sse" },
     { name = "loguru" },
     { name = "mcp" },
@@ -785,6 +786,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "anyio" },
+    { name = "exceptiongroup", marker = "python_full_version < '3.11'" },
     { name = "httpx-sse" },
     { name = "langchain-mcp-adapters", marker = "extra == 'test'" },
     { name = "langchain-openai", marker = "extra == 'test'" },

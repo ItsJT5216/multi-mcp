@@ -1,10 +1,8 @@
 {
-    "mcpServers": {
-        "unit_convertor":  {
-          "command": "python",
-          "args": [
-        "./tests/tools/unit_convertor.py"
-          ]
-        }
-    }
+	"mcpServers": {
+		"unit_convertor": {
+			"command": "python",
+			"args": ["./tests/tools/unit_convertor.py"]
+		}
+	}
 }

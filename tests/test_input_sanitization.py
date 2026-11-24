@@ -3,30 +3,29 @@ Tests for input sanitization: command validation, URL validation (SSRF),
 environment variable filtering, and API error response behavior.
 """
 
-import json
+from unittest.mock import AsyncMock, patch
+
 import pytest
 import pytest_asyncio
-from unittest.mock import patch, AsyncMock
-from starlette.testclient import TestClient
-
 from src.multimcp.mcp_client import (
+    PROTECTED_ENV_VARS,
+    MCPClientManager,
+    _filter_env,
     _validate_command,
     _validate_url,
-    _filter_env,
-    PROTECTED_ENV_VARS,
 )
+from src.multimcp.mcp_proxy import MCPProxyServer
 from src.multimcp.multi_mcp import (
     MAX_CONFIGURED_BACKENDS,
     MAX_HTTP_REQUEST_BODY_BYTES,
     MultiMCP,
 )
-from src.multimcp.mcp_proxy import MCPProxyServer
-from src.multimcp.mcp_client import MCPClientManager
-
+from starlette.testclient import TestClient
 
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
 
 @pytest_asyncio.fixture
 async def app_no_debug():
@@ -47,6 +46,7 @@ async def app_debug():
 # ---------------------------------------------------------------------------
 # 1. TestCommandValidation
 # ---------------------------------------------------------------------------
+
 
 class TestCommandValidation:
     """Tests for _validate_command() allowlist enforcement."""
@@ -75,7 +75,7 @@ class TestCommandValidation:
         monkeypatch.setenv("MULTI_MCP_ALLOWED_COMMANDS", "bash,sh")
         # bash and sh are now allowed
         _validate_command("bash")  # must not raise
-        _validate_command("sh")    # must not raise
+        _validate_command("sh")  # must not raise
         # node is no longer in the custom allowlist
         with pytest.raises(ValueError):
             _validate_command("node")
@@ -84,6 +84,7 @@ class TestCommandValidation:
 # ---------------------------------------------------------------------------
 # 2. TestUrlValidation
 # ---------------------------------------------------------------------------
+
 
 class TestUrlValidation:
     """Tests for _validate_url() scheme, hostname, and DNS validation."""
@@ -138,6 +139,7 @@ class TestUrlValidation:
 # 3. TestEnvFiltering
 # ---------------------------------------------------------------------------
 
+
 class TestEnvFiltering:
     """Tests for _filter_env() removal of protected environment variables."""
 
@@ -181,6 +183,7 @@ class TestEnvFiltering:
 # ---------------------------------------------------------------------------
 # 4. TestApiErrorResponses
 # ---------------------------------------------------------------------------
+
 
 class TestApiErrorResponses:
     """Tests for HTTP API error handling and debug mode."""
@@ -262,8 +265,10 @@ class TestApiErrorResponses:
 
         # Make unregister_client raise so we hit the 500 path in handle_mcp_servers DELETE
         original_unregister = app_no_debug.proxy.unregister_client
+
         async def _boom(name):
             raise RuntimeError("internal crash detail")
+
         app_no_debug.proxy.unregister_client = _boom
 
         tc = TestClient(app_no_debug.create_starlette_app())
@@ -284,6 +289,7 @@ class TestApiErrorResponses:
 
         async def _boom(name):
             raise RuntimeError("internal crash detail")
+
         app_debug.proxy.unregister_client = _boom
 
         tc = TestClient(app_debug.create_starlette_app())

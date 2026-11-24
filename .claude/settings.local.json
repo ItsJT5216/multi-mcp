@@ -1,23 +1,23 @@
 {
-  "permissions": {
-    "allow": [
-      "Bash(git add:*)",
-      "Bash(git commit:*)",
-      "Bash(git push:*)",
-      "Bash(make:*)",
-      "Bash(docker run:*)",
-      "Bash(lsof:*)",
-      "Bash(docker stop:*)",
-      "Bash(docker rm:*)",
-      "Bash(mv:*)",
-      "Bash(rm:*)",
-      "mcp__multi-mcp__github_search_repositories",
-      "mcp__multi-mcp__brave-search_brave_web_search",
-      "mcp__multi-mcp__context7_resolve-library-id",
-      "mcp__multi-mcp__context7_get-library-docs",
-      "mcp__multi-mcp__github_get_file_contents",
-      "mcp__multi-mcp__github_create_or_update_file"
-    ],
-    "deny": []
-  }
+	"permissions": {
+		"allow": [
+			"Bash(git add:*)",
+			"Bash(git commit:*)",
+			"Bash(git push:*)",
+			"Bash(make:*)",
+			"Bash(docker run:*)",
+			"Bash(lsof:*)",
+			"Bash(docker stop:*)",
+			"Bash(docker rm:*)",
+			"Bash(mv:*)",
+			"Bash(rm:*)",
+			"mcp__multi-mcp__github_search_repositories",
+			"mcp__multi-mcp__brave-search_brave_web_search",
+			"mcp__multi-mcp__context7_resolve-library-id",
+			"mcp__multi-mcp__context7_get-library-docs",
+			"mcp__multi-mcp__github_get_file_contents",
+			"mcp__multi-mcp__github_create_or_update_file"
+		],
+		"deny": []
+	}
 }
