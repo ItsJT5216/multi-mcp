@@ -1,0 +1,8 @@
+# Store the cache in a temporary location
+cache-dir = "/tmp/.ruff_cache"
+
+# Match Black so both CI format checks accept the same layout.
+line-length = 88
+
+[lint]
+ignore = ["E203"]

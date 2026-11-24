@@ -27,55 +27,84 @@ Improvements over the original mcp_client.py:
    affect others (the acknowledged shared-stack issue is resolved).
 """
 
-from contextlib import AsyncExitStack
-from typing import Any, Awaitable, Callable, Dict, Optional, Set
+import asyncio
 import ipaddress
 import os
-import asyncio
 import random
-import time
 import socket
+import time
 import urllib.parse
+from contextlib import AsyncExitStack
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, Optional, Set
 
-from mcp.client.stdio import StdioServerParameters, stdio_client
 from mcp.client.session import ClientSession
 from mcp.client.sse import sse_client
+from mcp.client.stdio import StdioServerParameters, stdio_client
 from mcp.client.streamable_http import streamable_http_client
 from src.utils.logger import get_logger
+
+if TYPE_CHECKING:
+    from src.multimcp.yaml_config import MultiMCPConfig
 
 
 # ── Security: command and URL validation ───────────────────────────────
 
 DEFAULT_ALLOWED_COMMANDS = {
-    "node", "npx", "uvx", "python", "python3", "uv", "docker", "bash", "sh",
+    "node",
+    "npx",
+    "uvx",
+    "python",
+    "python3",
+    "uv",
+    "docker",
+    "bash",
+    "sh",
 }
 
 PROTECTED_ENV_VARS = {
     # Linux/macOS loader injection
-    "PATH", "LD_PRELOAD", "LD_LIBRARY_PATH",
-    "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH", "DYLD_FRAMEWORK_PATH",
+    "PATH",
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_LIBRARY_PATH",
+    "DYLD_FRAMEWORK_PATH",
     # Language-specific injection
-    "PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP",
-    "NODE_OPTIONS", "NODE_PATH", "NODE_EXTRA_CA_CERTS",
-    "PERL5LIB", "PERL5OPT", "RUBYLIB", "RUBYOPT",
+    "PYTHONPATH",
+    "PYTHONHOME",
+    "PYTHONSTARTUP",
+    "NODE_OPTIONS",
+    "NODE_PATH",
+    "NODE_EXTRA_CA_CERTS",
+    "PERL5LIB",
+    "PERL5OPT",
+    "RUBYLIB",
+    "RUBYOPT",
     # Shell startup execution
-    "BASH_ENV", "ENV", "ZDOTDIR",
+    "BASH_ENV",
+    "ENV",
+    "ZDOTDIR",
     # Traffic interception
-    "http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY",
-    "ALL_PROXY", "all_proxy",
+    "http_proxy",
+    "https_proxy",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "all_proxy",
     # Identity / system
-    "HOME", "USER",
+    "HOME",
+    "USER",
 }
 
-_BACKOFF_BASE = 1.0   # seconds, initial retry delay
-_BACKOFF_CAP = 60.0   # seconds, maximum retry delay
+_BACKOFF_BASE = 1.0  # seconds, initial retry delay
+_BACKOFF_CAP = 60.0  # seconds, maximum retry delay
 
 # Dangerous IP ranges for SSRF protection.
 # NOTE: IPv4 loopback (127.0.0.0/8) and IPv6 loopback (::1/128) are intentionally
 # excluded so that localhost-based MCP servers remain accessible.
 _PRIVATE_RANGES: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = [
     ipaddress.ip_network("169.254.0.0/16"),  # IPv4 link-local (APIPA)
-    ipaddress.ip_network("fe80::/10"),        # IPv6 link-local — DNS-rebinding risk
+    ipaddress.ip_network("fe80::/10"),  # IPv6 link-local — DNS-rebinding risk
 ]
 
 
@@ -100,7 +129,11 @@ def _validate_command(command: str) -> None:
     if cmd_name in allowed:
         return
 
-    if (os.sep in command or "/" in command) and os.path.isfile(command) and os.access(command, os.X_OK):
+    if (
+        (os.sep in command or "/" in command)
+        and os.path.isfile(command)
+        and os.access(command, os.X_OK)
+    ):
         return
 
     if os.sep in command or "/" in command:
@@ -119,7 +152,9 @@ async def _validate_url(url: str) -> None:
     """Validate URL: check scheme, hostname presence, DNS resolvability, and SSRF safety."""
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme not in ("http", "https"):
-        raise ValueError(f"URL scheme '{parsed.scheme}' is not allowed. Only http/https permitted.")
+        raise ValueError(
+            f"URL scheme '{parsed.scheme}' is not allowed. Only http/https permitted."
+        )
     hostname = parsed.hostname
     if not hostname:
         raise ValueError("URL has no hostname.")
@@ -151,15 +186,19 @@ def _filter_env(env: dict) -> dict:
 
 def _is_transient_error(exc: BaseException) -> bool:
     """Classify whether an error is likely transient (retryable) vs permanent."""
-    return isinstance(exc, (
-        asyncio.TimeoutError,
-        ConnectionError,       # ConnectionRefusedError, ConnectionResetError, BrokenPipeError
-        OSError,               # covers socket.error, EAI errors
-        EOFError,
-    ))
+    return isinstance(
+        exc,
+        (
+            asyncio.TimeoutError,
+            ConnectionError,  # ConnectionRefusedError, ConnectionResetError, BrokenPipeError
+            OSError,  # covers socket.error, EAI errors
+            EOFError,
+        ),
+    )
 
 
 # ── Client Manager ─────────────────────────────────────────────────────
+
 
 class MCPClientManager:
     """Manages the lifecycle of multiple MCP clients (stdio, SSE, Streamable HTTP).
@@ -263,7 +302,9 @@ class MCPClientManager:
             read, write, _ = await fallback_stack.enter_async_context(
                 streamable_http_client(url)
             )
-            client = await fallback_stack.enter_async_context(ClientSession(read, write))
+            client = await fallback_stack.enter_async_context(
+                ClientSession(read, write)
+            )
             # Success: absorb nested stack into the main server_stack
             await server_stack.enter_async_context(fallback_stack)
             self.logger.info(f"🌐 Connected to '{name}' via Streamable HTTP")
@@ -289,6 +330,7 @@ class MCPClientManager:
         Returns:
             Dict mapping server_name -> list[types.Tool]
         """
+
         async def _discover_one(name: str, server_config) -> tuple[str, list]:
             """Discover a single server (semaphore-bounded)."""
             async with self._connection_semaphore:
@@ -340,7 +382,10 @@ class MCPClientManager:
         try:
             await server_stack.__aenter__()
             client = await self._negotiate_http_transport(
-                name, url, server_stack, transport_type,
+                name,
+                url,
+                server_stack,
+                transport_type,
             )
             init_result = await client.initialize()
             tools = []
@@ -358,7 +403,9 @@ class MCPClientManager:
             except Exception:
                 pass
 
-    async def _discover_stdio(self, name: str, server_dict: dict, server_config) -> list:
+    async def _discover_stdio(
+        self, name: str, server_dict: dict, server_config
+    ) -> list:
         """Discover tools from a stdio server. Keeps always_on servers connected."""
         server_stack = AsyncExitStack()
         try:
@@ -377,7 +424,8 @@ class MCPClientManager:
             client = await server_stack.enter_async_context(ClientSession(read, write))
 
             init_result = await asyncio.wait_for(
-                client.initialize(), timeout=self._connection_timeout,
+                client.initialize(),
+                timeout=self._connection_timeout,
             )
             tools = []
             if init_result.capabilities.tools:
@@ -497,19 +545,28 @@ class MCPClientManager:
                     merged_env.update(safe_env)
                     self.logger.info(f"🔌 Creating stdio client for {name}")
                     params = StdioServerParameters(
-                        command=command, args=args, env=merged_env,
+                        command=command,
+                        args=args,
+                        env=merged_env,
                     )
-                    read, write = await server_stack.enter_async_context(stdio_client(params))
+                    read, write = await server_stack.enter_async_context(
+                        stdio_client(params)
+                    )
                     session = await server_stack.enter_async_context(
                         ClientSession(read, write)
                     )
                 elif url:
                     transport_type = server.get("type")
                     session = await self._negotiate_http_transport(
-                        name, url, server_stack, transport_type,
+                        name,
+                        url,
+                        server_stack,
+                        transport_type,
                     )
                 else:
-                    self.logger.warning(f"⚠️ Skipping {name}: No command or URL provided.")
+                    self.logger.warning(
+                        f"⚠️ Skipping {name}: No command or URL provided."
+                    )
                     await server_stack.aclose()
                     ready_event.set()
                     return
@@ -582,7 +639,8 @@ class MCPClientManager:
         """Disconnect lazy servers that have exceeded their idle timeout."""
         now = time.monotonic()
         to_disconnect = [
-            name for name in list(self.clients.keys())
+            name
+            for name in list(self.clients.keys())
             if name not in self.always_on_servers
             and name in self.idle_timeouts
             and now - self.last_used.get(name, 0) > self.idle_timeouts[name]
@@ -604,7 +662,9 @@ class MCPClientManager:
                 try:
                     await self._on_server_disconnected(name)
                 except Exception as e:
-                    self.logger.warning(f"⚠️ Disconnect callback failed for '{name}': {e}")
+                    self.logger.warning(
+                        f"⚠️ Disconnect callback failed for '{name}': {e}"
+                    )
 
     async def start_idle_checker(self, interval_seconds: float = 60.0) -> None:
         """Background task: periodically disconnect idle lazy servers."""
@@ -646,7 +706,9 @@ class MCPClientManager:
                 if not server_config:
                     continue
 
-                self.logger.warning(f"⚠️ Always-on server '{name}' disconnected — reconnecting...")
+                self.logger.warning(
+                    f"⚠️ Always-on server '{name}' disconnected — reconnecting..."
+                )
                 try:
                     await asyncio.wait_for(
                         self._create_single_client(name, server_config),
@@ -713,9 +775,7 @@ class MCPClientManager:
             except asyncio.CancelledError:
                 return
             except Exception as exc:
-                self.logger.warning(
-                    f"🔌 Supervision for '{name}' caught error: {exc}"
-                )
+                self.logger.warning(f"🔌 Supervision for '{name}' caught error: {exc}")
             finally:
                 if name in self.clients:
                     self.logger.info(f"🔄 Cleaning up '{name}' for watchdog reconnect")
