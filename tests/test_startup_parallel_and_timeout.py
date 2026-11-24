@@ -18,11 +18,10 @@ from datetime import timedelta
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from pydantic import ValidationError
 from mcp import types
 from mcp.server import Server
 from mcp.shared.memory import create_connected_server_and_client_session
-
+from pydantic import ValidationError
 from src.multimcp.mcp_client import MCPClientManager
 from src.multimcp.mcp_proxy import MCPProxyServer, ToolMapping
 from src.multimcp.multi_mcp import MultiMCP
@@ -35,7 +34,7 @@ from src.multimcp.yaml_config import (
 
 DELAY = 0.25  # per-server simulated connect/init latency
 N_SERVERS = 3
-SEQUENTIAL_FLOOR = DELAY * N_SERVERS          # 0.75s if connections were serial
+SEQUENTIAL_FLOOR = DELAY * N_SERVERS  # 0.75s if connections were serial
 PARALLEL_CEILING = DELAY * N_SERVERS - DELAY  # 0.5s — must beat serial by >= one DELAY
 
 
@@ -170,9 +169,7 @@ async def test_connect_always_on_skips_lazy_servers():
 @pytest.mark.asyncio
 async def test_connect_always_on_failure_isolated():
     """Regression guard: one failing server doesn't block the others."""
-    mm, connected = _make_multi_mcp_with_slow_manager(
-        delay=0.01, fail_servers={"srv1"}
-    )
+    mm, connected = _make_multi_mcp_with_slow_manager(delay=0.01, fail_servers={"srv1"})
     config = _yaml_config_with_servers(3, always_on=True)
 
     await mm._connect_always_on_servers(config)  # must not raise
@@ -207,9 +204,7 @@ async def test_connect_json_config_servers_concurrent():
 @pytest.mark.asyncio
 async def test_connect_json_config_servers_failure_isolated():
     """Regression guard: one failing server doesn't abort JSON-config init."""
-    mm, connected = _make_multi_mcp_with_slow_manager(
-        delay=0.01, fail_servers={"srv0"}
-    )
+    mm, connected = _make_multi_mcp_with_slow_manager(delay=0.01, fail_servers={"srv0"})
     config = _yaml_config_with_servers(3, always_on=False)
 
     await mm._connect_json_config_servers(config)  # must not raise
@@ -257,9 +252,7 @@ def _call_req(key: str, arguments: dict = None) -> types.CallToolRequest:
 async def test_tool_call_timeout_wired_when_configured():
     """When tool_call_timeout_seconds is set, call_tool gets read_timeout_seconds."""
     mock_client = AsyncMock()
-    mock_client.call_tool = AsyncMock(
-        return_value=types.CallToolResult(content=[])
-    )
+    mock_client.call_tool = AsyncMock(return_value=types.CallToolResult(content=[]))
     proxy = _make_proxy_with_tool(
         client=mock_client,
         server_config={"command": "echo", "tool_call_timeout_seconds": 7},
@@ -276,9 +269,7 @@ async def test_tool_call_timeout_wired_when_configured():
 async def test_tool_call_inherits_finite_timeout_by_default():
     """An unset tool override inherits the finite backend operation deadline."""
     mock_client = AsyncMock()
-    mock_client.call_tool = AsyncMock(
-        return_value=types.CallToolResult(content=[])
-    )
+    mock_client.call_tool = AsyncMock(return_value=types.CallToolResult(content=[]))
     proxy = _make_proxy_with_tool(client=mock_client, server_config={"command": "echo"})
 
     await proxy._call_tool(_call_req("srv__echo"))
@@ -345,9 +336,7 @@ async def test_admitted_handler_delegates_and_releases_slots():
         message, session, lifespan, False, session_semaphore
     )
 
-    proxy._handle_message.assert_awaited_once_with(
-        message, session, lifespan, False
-    )
+    proxy._handle_message.assert_awaited_once_with(message, session, lifespan, False)
     await asyncio.wait_for(proxy._request_semaphore.acquire(), timeout=0.1)
     await asyncio.wait_for(session_semaphore.acquire(), timeout=0.1)
 
@@ -439,9 +428,7 @@ async def test_slow_backend_times_out_e2e():
         result = await proxy._call_tool(_call_req("slow__hang"))
         elapsed = time.monotonic() - start
 
-        assert elapsed < 2.0, (
-            f"tool call took {elapsed:.2f}s — timeout of 0.3s was not enforced"
-        )
+        assert elapsed < 2.0, f"tool call exceeded deadline ({elapsed:.2f}s)"
         assert result.root.isError is True
         # Timeout failure feeds the circuit breaker (repeated hangs quarantine)
         assert proxy._tool_failure_counts.get("slow__hang") == 1
@@ -457,9 +444,12 @@ def test_server_config_timeout_field_validation():
     default_config = ServerConfig(command="echo")
     assert default_config.operation_timeout_seconds == 30.0
     assert default_config.tool_call_timeout_seconds is None
-    assert ServerConfig(
-        command="echo", tool_call_timeout_seconds=30
-    ).tool_call_timeout_seconds == 30.0
+    assert (
+        ServerConfig(
+            command="echo", tool_call_timeout_seconds=30
+        ).tool_call_timeout_seconds
+        == 30.0
+    )
 
     with pytest.raises(ValidationError):
         ServerConfig(command="echo", tool_call_timeout_seconds=0)
@@ -471,9 +461,9 @@ def test_server_config_timeout_field_validation():
         ServerConfig(command="echo", tool_call_timeout_seconds=3601)
 
     # exclude_none keeps unset timeout out of server dicts (previous shape kept)
-    assert "tool_call_timeout_seconds" not in ServerConfig(
-        command="echo"
-    ).model_dump(exclude_none=True)
+    assert "tool_call_timeout_seconds" not in ServerConfig(command="echo").model_dump(
+        exclude_none=True
+    )
     assert (
         ServerConfig(command="echo", tool_call_timeout_seconds=15).model_dump(
             exclude_none=True
@@ -530,8 +520,6 @@ async def test_create_clients_eager_connection_is_bounded():
     manager._stop_server_lifecycle = AsyncMock()
 
     with pytest.raises(asyncio.TimeoutError):
-        await manager.create_clients(
-            {"mcpServers": {"slow": {"command": "echo"}}}
-        )
+        await manager.create_clients({"mcpServers": {"slow": {"command": "echo"}}})
 
     manager._stop_server_lifecycle.assert_awaited_once_with("slow")

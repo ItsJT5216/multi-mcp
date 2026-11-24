@@ -1,19 +1,22 @@
-from typing import TYPE_CHECKING, Any, Optional
 import asyncio
 import hashlib
-import json
 import uuid
+from dataclasses import dataclass
 from datetime import timedelta
+from typing import TYPE_CHECKING, Any, Optional
+
 from mcp import server, types
 from mcp.client.session import ClientSession
 from mcp.server.session import ServerSession
 from mcp.shared.exceptions import McpError
-from mcp.types import ErrorData, INVALID_PARAMS, INTERNAL_ERROR
-from src.utils.logger import get_logger
+from mcp.types import INTERNAL_ERROR, INVALID_PARAMS, ErrorData
 from src.multimcp.mcp_client import MCPClientManager
-from src.multimcp.utils.audit import AuditLogger
 from src.multimcp.mcp_trigger_manager import MCPTriggerManager
-from dataclasses import dataclass
+from src.multimcp.utils.audit import AuditLogger
+from src.utils.logger import get_logger
+
+if TYPE_CHECKING:
+    from src.multimcp.yaml_config import MultiMCPConfig
 
 if TYPE_CHECKING:
     from src.multimcp.retrieval.pipeline import RetrievalPipeline
@@ -81,9 +84,8 @@ class MCPProxyServer(server.Server):
     def __init__(self, client_manager: MCPClientManager):
         super().__init__("MultiMCP proxy Server")
         self.capabilities: dict[str, types.ServerCapabilities] = {}
-        self.tool_to_server: dict[
-            str, ToolMapping
-        ] = {}  # Support same tool name in different mcp server
+        # Allow different servers to expose tools with the same name.
+        self.tool_to_server: dict[str, ToolMapping] = {}
         self.prompt_to_server: dict[str, PromptMapping] = {}
         self.resource_to_server: dict[str, ResourceMapping] = {}
         self._register_lock = asyncio.Lock()  # Lock for concurrent register/unregister
@@ -132,10 +134,12 @@ class MCPProxyServer(server.Server):
         Skips servers that already have live clients (avoids overwriting real entries).
         """
         from src.multimcp.cache_manager import get_enabled_tools
+
         for server_name, server_config in yaml_config.servers.items():
             # Don't overwrite entries already populated by live initialization
             existing_keys = {
-                k for k, v in self.tool_to_server.items()
+                k
+                for k, v in self.tool_to_server.items()
                 if v.server_name == server_name and v.client is not None
             }
             if existing_keys:
@@ -172,6 +176,7 @@ class MCPProxyServer(server.Server):
         runs in parallel so startup latency is bounded by the slowest server,
         not the sum of all servers. Failures are isolated per client.
         """
+
         async def _init_one(name: str, client: ClientSession) -> Optional[str]:
             try:
                 await self.initialize_single_client(name, client)
@@ -201,9 +206,7 @@ class MCPProxyServer(server.Server):
 
         self.logger.info(f"try initialize client {name}: {client}")
         timeout = (
-            self.client_manager._connection_timeout
-            if self.client_manager
-            else 30.0
+            self.client_manager._connection_timeout if self.client_manager else 30.0
         )
         result = await self._run_backend_operation(
             name,
@@ -230,7 +233,9 @@ class MCPProxyServer(server.Server):
                         server_name=name, client=client, prompt=prompt
                     )
             except Exception as e:
-                self.logger.warning(f"⚠️ '{name}' advertises prompts but list_prompts failed: {e}")
+                self.logger.warning(
+                    f"⚠️ '{name}' advertises prompts but list_prompts failed: {e}"
+                )
 
         if result.capabilities.resources:
             try:
@@ -247,7 +252,9 @@ class MCPProxyServer(server.Server):
                         server_name=name, client=client, resource=resource
                     )
             except Exception as e:
-                self.logger.warning(f"⚠️ '{name}' advertises resources but list_resources failed: {e}")
+                self.logger.warning(
+                    f"⚠️ '{name}' advertises resources but list_resources failed: {e}"
+                )
 
     async def register_client(self, name: str, client: ClientSession) -> None:
         """Add a new client and register its capabilities."""
@@ -275,7 +282,7 @@ class MCPProxyServer(server.Server):
                     self._forget_server_config(name)
                     self.logger.info(f"✅ Removed unconnected server config '{name}'.")
                 else:
-                    self.logger.warning(f"⚠️ Tried to unregister unknown client: {name}")
+                    self.logger.warning(f"⚠️ Cannot unregister unknown client: {name}")
                 return
 
             # Check if client had tools capability before removing
@@ -298,7 +305,9 @@ class MCPProxyServer(server.Server):
                 k: v for k, v in self.prompt_to_server.items() if v.server_name != name
             }
             self.resource_to_server = {
-                k: v for k, v in self.resource_to_server.items() if v.server_name != name
+                k: v
+                for k, v in self.resource_to_server.items()
+                if v.server_name != name
             }
 
             self.logger.info(f"✅ Client '{name}' fully unregistered.")
@@ -339,7 +348,9 @@ class MCPProxyServer(server.Server):
         self.client_manager.last_used.pop(name, None)
         self.client_manager._creation_locks.pop(name, None)
 
-    async def toggle_tool(self, server_name: str, tool_name: str, enabled: bool) -> dict:
+    async def toggle_tool(
+        self, server_name: str, tool_name: str, enabled: bool
+    ) -> dict:
         """Enable or disable a single tool at runtime without restarting the server.
 
         Disabling: removes the tool from tool_to_server (invisible to new clients)
@@ -361,7 +372,10 @@ class MCPProxyServer(server.Server):
             if not enabled:
                 # ── DISABLE ──────────────────────────────────────────────
                 if key not in self.tool_to_server:
-                    return {"status": "noop", "reason": f"tool '{key}' not currently visible"}
+                    return {
+                        "status": "noop",
+                        "reason": f"tool '{key}' not currently visible",
+                    }
 
                 self.tool_to_server.pop(key, None)
 
@@ -404,14 +418,15 @@ class MCPProxyServer(server.Server):
 
                 # Try to find it in server_configs YAML tool data via MultiMCPConfig
                 # We reconstruct the minimal Tool; full schema comes from YAML via ToolEntry
-                from src.multimcp.yaml_config import MultiMCPConfig  # avoid circular at module level
                 tool_description = ""
                 tool_input_schema: dict = {"type": "object", "properties": {}}
 
                 # Look up in any existing ToolMapping (e.g. from a recently unregistered entry)
                 # or fall back to a stub — real schema arrives on next discovery
                 if hasattr(self, "_yaml_config_ref"):
-                    srv_cfg = getattr(self._yaml_config_ref, "servers", {}).get(server_name)
+                    srv_cfg = getattr(self._yaml_config_ref, "servers", {}).get(
+                        server_name
+                    )
                     if srv_cfg:
                         entry = srv_cfg.tools.get(tool_name)
                         if entry:
@@ -423,7 +438,11 @@ class MCPProxyServer(server.Server):
                     description=tool_description,
                     inputSchema=tool_input_schema,
                 )
-                client = self.client_manager.clients.get(server_name) if self.client_manager else None
+                client = (
+                    self.client_manager.clients.get(server_name)
+                    if self.client_manager
+                    else None
+                )
                 self.tool_to_server[key] = ToolMapping(
                     server_name=server_name,
                     client=client,  # None → lazy-connect on first call
@@ -433,8 +452,11 @@ class MCPProxyServer(server.Server):
         await self._send_tools_list_changed()
         if self.retrieval_pipeline is not None:
             self.retrieval_pipeline.rebuild_catalog(self.tool_to_server)
-        visible = sum(1 for m in self.tool_to_server.values()
-                      if m.server_name == server_name and m.client is not None)
+        visible = sum(
+            1
+            for m in self.tool_to_server.values()
+            if m.server_name == server_name and m.client is not None
+        )
         return {
             "status": "ok",
             "tool": key,
@@ -442,7 +464,7 @@ class MCPProxyServer(server.Server):
             "visible_tools_for_server": visible,
         }
 
-    ## Tools capabilities
+    # Tools capabilities
     def _get_session_id(self) -> str:
         """Derive a stable per-session UUID from the current MCP server session.
 
@@ -502,9 +524,15 @@ class MCPProxyServer(server.Server):
             session_id = self._get_session_id()
             # Build conversation context from session history
             conv_parts: list[str] = []
-            conv_parts.extend(self.retrieval_pipeline.get_session_tool_history(session_id))
-            conv_parts.extend(self.retrieval_pipeline.get_session_argument_keys(session_id))
-            conv_parts.extend(self.retrieval_pipeline.get_session_router_describes(session_id))
+            conv_parts.extend(
+                self.retrieval_pipeline.get_session_tool_history(session_id)
+            )
+            conv_parts.extend(
+                self.retrieval_pipeline.get_session_argument_keys(session_id)
+            )
+            conv_parts.extend(
+                self.retrieval_pipeline.get_session_router_describes(session_id)
+            )
             conversation_context = " ".join(conv_parts)
             tools = await self.retrieval_pipeline.get_tools_for_list(
                 session_id, conversation_context
@@ -551,7 +579,11 @@ class MCPProxyServer(server.Server):
 
         # Routing tool dispatch — must come before trigger manager and registry lookup
         try:
-            from src.multimcp.retrieval.routing_tool import ROUTING_TOOL_NAME, handle_routing_call
+            from src.multimcp.retrieval.routing_tool import (
+                ROUTING_TOOL_NAME,
+                handle_routing_call,
+            )
+
             _has_routing = True
         except ImportError:
             _has_routing = False
@@ -560,7 +592,9 @@ class MCPProxyServer(server.Server):
             name = arguments.get("name", "")
             describe = bool(arguments.get("describe", False))
             call_args = arguments.get("arguments", {})
-            content = handle_routing_call(name, describe, call_args, self.tool_to_server)
+            content = handle_routing_call(
+                name, describe, call_args, self.tool_to_server
+            )
             if (
                 content
                 and hasattr(content[0], "text")
@@ -574,7 +608,9 @@ class MCPProxyServer(server.Server):
                         name=actual_tool_name, arguments=call_args
                     ),
                 )
-                proxy_result = await self._call_tool(proxy_req, _skip_pipeline_record=True)
+                proxy_result = await self._call_tool(
+                    proxy_req, _skip_pipeline_record=True
+                )
                 # Record router proxy accounting (CF-2) — single write path
                 # _skip_pipeline_record=True suppresses the direct on_tool_called()
                 # inside the inner call so only this proxy path records (is_router_proxy=True).
@@ -618,7 +654,9 @@ class MCPProxyServer(server.Server):
                 try:
                     await self.initialize_single_client(server_name, client)
                     refresh_needed = True
-                    self.logger.info(f"🔥 Auto-enabled server '{server_name}' via trigger")
+                    self.logger.info(
+                        f"🔥 Auto-enabled server '{server_name}' via trigger"
+                    )
                 except Exception as e:
                     self.logger.warning(
                         f"⚠️ Trigger-enabled '{server_name}' failed to initialize: {e}"
@@ -635,20 +673,34 @@ class MCPProxyServer(server.Server):
             # If client is None (cached from YAML, server not yet connected), connect now
             if tool_item.client is None:
                 try:
-                    self.logger.info(f"🔌 Connecting '{tool_item.server_name}' on first tool call...")
-                    client = await self.client_manager.get_or_create_client(tool_item.server_name)
+                    self.logger.info(
+                        f"🔌 Connecting '{tool_item.server_name}' on first tool call..."
+                    )
+                    client = await self.client_manager.get_or_create_client(
+                        tool_item.server_name
+                    )
                     await self.initialize_single_client(tool_item.server_name, client)
                     await self._send_tools_list_changed()
                     tool_item = self.tool_to_server.get(tool_name)
                 except Exception as e:
                     return types.ServerResult(
-                        content=[types.TextContent(type="text", text=f"Failed to connect server '{tool_item.server_name}': {e}")],
+                        content=[
+                            types.TextContent(
+                                type="text",
+                                text=f"Failed to connect server '{tool_item.server_name}': {e}",
+                            )
+                        ],
                         isError=True,
                     )
 
             if tool_item is None or tool_item.client is None:
                 return types.ServerResult(
-                    content=[types.TextContent(type="text", text=f"Tool '{tool_name}' server failed to connect.")],
+                    content=[
+                        types.TextContent(
+                            type="text",
+                            text=f"Tool '{tool_name}' server failed to connect.",
+                        )
+                    ],
                     isError=True,
                 )
 
@@ -681,7 +733,7 @@ class MCPProxyServer(server.Server):
                     self.client_manager.record_usage(tool_item.server_name)
 
                 # Success: reset circuit breaker for this tool
-                getattr(self, '_tool_failure_counts', {}).pop(tool_name, None)
+                getattr(self, "_tool_failure_counts", {}).pop(tool_name, None)
 
                 # Notify retrieval pipeline of tool usage (turn-boundary based).
                 # Suppressed when _skip_pipeline_record=True (routing-tool proxy inner call)
@@ -693,7 +745,9 @@ class MCPProxyServer(server.Server):
                             _session_id, tool_name, arguments
                         )
                     except Exception as e:
-                        self.logger.warning(f"⚠️ Retrieval pipeline error on tool call: {e}")
+                        self.logger.warning(
+                            f"⚠️ Retrieval pipeline error on tool call: {e}"
+                        )
 
                 return types.ServerResult(result)
             except Exception as e:
@@ -711,10 +765,10 @@ class MCPProxyServer(server.Server):
                 # Circuit breaker: count consecutive transport failures.
                 # NOTE: We only count exceptions from call_tool (transport-level failures),
                 # NOT result.isError=True (those are tool responses — could be valid arg errors).
-                failure_counts = getattr(self, '_tool_failure_counts', {})
+                failure_counts = getattr(self, "_tool_failure_counts", {})
                 count = failure_counts.get(tool_name, 0) + 1
                 failure_counts[tool_name] = count
-                if count >= getattr(self, 'quarantine_threshold', 3):
+                if count >= getattr(self, "quarantine_threshold", 3):
                     self.logger.error(
                         f"🚫 Tool '{tool_name}' has failed {count} consecutive times "
                         f"with transport errors — auto-quarantining to protect the server. "
@@ -723,9 +777,13 @@ class MCPProxyServer(server.Server):
                     )
                     self._tool_failure_counts.pop(tool_name, None)
                     try:
-                        await self.toggle_tool(tool_item.server_name, original_name, enabled=False)
+                        await self.toggle_tool(
+                            tool_item.server_name, original_name, enabled=False
+                        )
                     except Exception as quarantine_err:
-                        self.logger.warning(f"⚠️ Auto-quarantine failed for '{tool_name}': {quarantine_err}")
+                        self.logger.warning(
+                            f"⚠️ Auto-quarantine failed for '{tool_name}': {quarantine_err}"
+                        )
 
                 # Return error to client
                 return types.ServerResult(
@@ -754,7 +812,7 @@ class MCPProxyServer(server.Server):
             isError=True,
         )
 
-    ## Prompts capabilities
+    # Prompts capabilities
     async def _list_prompts(self, _: Any) -> types.ServerResult:
         """Return cached prompts from all remote MCP servers with namespacing."""
         all_prompts = []
@@ -781,24 +839,31 @@ class MCPProxyServer(server.Server):
                 )
             except Exception as e:
                 self.logger.error(f"❌ Failed to get prompt '{prompt_name}': {e}")
-                raise McpError(ErrorData(code=INTERNAL_ERROR, message=f"Failed to get prompt '{prompt_name}': {e}"))
+                raise McpError(
+                    ErrorData(
+                        code=INTERNAL_ERROR,
+                        message=f"Failed to get prompt '{prompt_name}': {e}",
+                    )
+                )
             return types.ServerResult(result)
 
         self.logger.error(f"⚠️ Prompt '{prompt_name}' not found in any server.")
-        raise McpError(ErrorData(code=INVALID_PARAMS, message=f"Prompt '{prompt_name}' not found"))
+        raise McpError(
+            ErrorData(code=INVALID_PARAMS, message=f"Prompt '{prompt_name}' not found")
+        )
 
     async def _complete(self, req: types.CompleteRequest) -> types.ServerResult:
         """Execute a prompt completion on the relevant MCP server."""
         prompt_name = None
         mapping = None
-        if hasattr(req.params.ref, 'name'):
+        if hasattr(req.params.ref, "name"):
             prompt_name = req.params.ref.name
             mapping = self.prompt_to_server.get(prompt_name)
 
         if mapping and mapping.client:
             try:
                 ref = req.params.ref
-                if hasattr(ref, 'name'):
+                if hasattr(ref, "name"):
                     _, original_name = self._split_key(ref.name)
                     ref = ref.model_copy(update={"name": original_name})
                 result = await self._run_backend_operation(
@@ -808,14 +873,24 @@ class MCPProxyServer(server.Server):
                 )
             except Exception as e:
                 self.logger.error(f"❌ Failed to complete prompt '{prompt_name}': {e}")
-                raise McpError(ErrorData(code=INTERNAL_ERROR, message=f"Failed to complete prompt '{prompt_name}': {e}"))
+                raise McpError(
+                    ErrorData(
+                        code=INTERNAL_ERROR,
+                        message=f"Failed to complete prompt '{prompt_name}': {e}",
+                    )
+                )
             return types.ServerResult(result)
 
-        ref_desc = prompt_name or str(getattr(req.params.ref, 'uri', 'unknown'))
+        ref_desc = prompt_name or str(getattr(req.params.ref, "uri", "unknown"))
         self.logger.error(f"⚠️ Prompt '{ref_desc}' not found for completion.")
-        raise McpError(ErrorData(code=INVALID_PARAMS, message=f"Prompt '{ref_desc}' not found for completion"))
+        raise McpError(
+            ErrorData(
+                code=INVALID_PARAMS,
+                message=f"Prompt '{ref_desc}' not found for completion",
+            )
+        )
 
-    ## Resources capabilities
+    # Resources capabilities
     async def _list_resources(self, _: Any) -> types.ServerResult:
         """Return cached resources from all remote MCP servers."""
         all_resources = []
@@ -823,7 +898,9 @@ class MCPProxyServer(server.Server):
             namespaced_resource = mapping.resource.model_copy()
             # Prefix name with server for disambiguation; URI stays raw for lookups
             original_name = namespaced_resource.name or str(namespaced_resource.uri)
-            namespaced_resource.name = self._make_key(mapping.server_name, original_name)
+            namespaced_resource.name = self._make_key(
+                mapping.server_name, original_name
+            )
             all_resources.append(namespaced_resource)
         return types.ServerResult(resources=all_resources)
 
@@ -844,11 +921,20 @@ class MCPProxyServer(server.Server):
                 )
             except Exception as e:
                 self.logger.error(f"❌ Failed to read resource '{resource_uri}': {e}")
-                raise McpError(ErrorData(code=INTERNAL_ERROR, message=f"Failed to read resource '{resource_uri}': {e}"))
+                raise McpError(
+                    ErrorData(
+                        code=INTERNAL_ERROR,
+                        message=f"Failed to read resource '{resource_uri}': {e}",
+                    )
+                )
             return types.ServerResult(result)
 
         self.logger.error(f"⚠️ Resource '{resource_uri}' not found in any server.")
-        raise McpError(ErrorData(code=INVALID_PARAMS, message=f"Resource '{resource_uri}' not found"))
+        raise McpError(
+            ErrorData(
+                code=INVALID_PARAMS, message=f"Resource '{resource_uri}' not found"
+            )
+        )
 
     async def _subscribe_resource(
         self, req: types.SubscribeRequest
@@ -868,10 +954,20 @@ class MCPProxyServer(server.Server):
                 return types.ServerResult(types.EmptyResult())
             except Exception as e:
                 self.logger.error(f"❌ Failed to subscribe to resource '{uri}': {e}")
-                raise McpError(ErrorData(code=INTERNAL_ERROR, message=f"Failed to subscribe to resource '{uri}': {e}"))
+                raise McpError(
+                    ErrorData(
+                        code=INTERNAL_ERROR,
+                        message=f"Failed to subscribe to resource '{uri}': {e}",
+                    )
+                )
 
         self.logger.error(f"⚠️ Resource '{uri}' not found for subscription.")
-        raise McpError(ErrorData(code=INVALID_PARAMS, message=f"Resource '{uri}' not found for subscription"))
+        raise McpError(
+            ErrorData(
+                code=INVALID_PARAMS,
+                message=f"Resource '{uri}' not found for subscription",
+            )
+        )
 
     async def _unsubscribe_resource(
         self, req: types.UnsubscribeRequest
@@ -893,10 +989,20 @@ class MCPProxyServer(server.Server):
                 self.logger.error(
                     f"❌ Failed to unsubscribe from resource '{uri}': {e}"
                 )
-                raise McpError(ErrorData(code=INTERNAL_ERROR, message=f"Failed to unsubscribe from resource '{uri}': {e}"))
+                raise McpError(
+                    ErrorData(
+                        code=INTERNAL_ERROR,
+                        message=f"Failed to unsubscribe from resource '{uri}': {e}",
+                    )
+                )
 
         self.logger.error(f"⚠️ Resource '{uri}' not found for unsubscription.")
-        raise McpError(ErrorData(code=INVALID_PARAMS, message=f"Resource '{uri}' not found for unsubscription"))
+        raise McpError(
+            ErrorData(
+                code=INVALID_PARAMS,
+                message=f"Resource '{uri}' not found for unsubscription",
+            )
+        )
 
     def _register_request_handlers(self) -> None:
         """Dynamically registers handlers for all MCP requests."""
@@ -941,9 +1047,7 @@ class MCPProxyServer(server.Server):
             return tool_list
         for tool in tools_result.tools:
             if not self._is_tool_allowed(tool.name, tool_filter):
-                self.logger.debug(
-                    f"🚫 Filtered out '{tool.name}' from '{server_name}'"
-                )
+                self.logger.debug(f"🚫 Filtered out '{tool.name}' from '{server_name}'")
                 continue
 
             key = self._make_key(server_name, tool.name)
@@ -1065,7 +1169,7 @@ class MCPProxyServer(server.Server):
         if "*" in deny or tool_name in deny:
             return False
         allow = filter_config.get("allow", ["*"])
-        if not allow:   # Empty allow list = deny all
+        if not allow:  # Empty allow list = deny all
             return False
         return "*" in allow or tool_name in allow
 
@@ -1097,7 +1201,9 @@ class MCPProxyServer(server.Server):
         await self._send_tools_list_changed()
         await self._send_prompts_list_changed()
         await self._send_resources_list_changed()
-        self.logger.info(f"🔄 Reset tool, prompt, and resource mappings for disconnected server '{server_name}'")
+        self.logger.info(
+            f"🔄 Reset tool, prompt, and resource mappings for disconnected server '{server_name}'"
+        )
 
     async def _send_tools_list_changed(self) -> None:
         """Send tools/list_changed notification if a session is active."""
@@ -1181,7 +1287,7 @@ class MCPProxyServer(server.Server):
         raise_exceptions: bool = False,
     ):
         """Override run to capture the server session for notifications.
-        
+
         NOTE(M8): This method intentionally does NOT call super().run().
         Instead, it reimplements the session lifecycle to capture the ServerSession
         reference needed for sending tool/prompt/resource list_changed notifications.
@@ -1189,9 +1295,10 @@ class MCPProxyServer(server.Server):
         the session context directly to retain a reference in self._server_session.
         """
         # Import here to avoid circular dependencies
-        from mcp.server.session import ServerSession
         from contextlib import AsyncExitStack
+
         import anyio
+        from mcp.server.session import ServerSession
 
         async with AsyncExitStack() as stack:
             lifespan_context = await stack.enter_async_context(self.lifespan(self))
@@ -1241,7 +1348,9 @@ class MCPProxyServer(server.Server):
                         raise
 
             # Clear session when done
-            if self.retrieval_pipeline is not None and hasattr(self.retrieval_pipeline, "cleanup_session"):
+            if self.retrieval_pipeline is not None and hasattr(
+                self.retrieval_pipeline, "cleanup_session"
+            ):
                 try:
                     _teardown_session_id = self._get_session_id()
                     self.retrieval_pipeline.cleanup_session(_teardown_session_id)

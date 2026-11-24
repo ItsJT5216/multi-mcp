@@ -4,31 +4,18 @@ Covers: _list_prompts, _get_prompt, _list_resources, _read_resource,
         _subscribe_resource, _unsubscribe_resource, and error paths.
 """
 
+from unittest.mock import AsyncMock, MagicMock, patch
+
 import pytest
-from unittest.mock import AsyncMock, MagicMock
 from mcp import types
 from mcp.shared.exceptions import McpError
-
 from src.multimcp.mcp_proxy import MCPProxyServer, PromptMapping, ResourceMapping
 
 
 def _make_proxy():
-    """Create a minimal MCPProxyServer bypassing __init__ for unit testing."""
-    proxy = MCPProxyServer.__new__(MCPProxyServer)
-    proxy.tool_to_server = {}
-    proxy.prompt_to_server = {}
-    proxy.resource_to_server = {}
-    proxy._resource_objects = {}
-    proxy.client_manager = MagicMock()
-    proxy.trigger_manager = MagicMock()
-    proxy.audit_logger = MagicMock()
-    proxy.logger = MagicMock()
-    proxy._register_lock = MagicMock()
-    proxy._register_lock.__aenter__ = AsyncMock()
-    proxy._register_lock.__aexit__ = AsyncMock()
-    proxy.retrieval_pipeline = None
-    proxy._server_session = None
-    proxy.capabilities = {}
+    """Build the proxy with a mocked backend manager and audit logger."""
+    with patch("src.multimcp.mcp_proxy.AuditLogger"):
+        proxy = MCPProxyServer(MagicMock())
     return proxy
 
 
@@ -49,11 +36,13 @@ class TestListPrompts:
         proxy = _make_proxy()
         client = AsyncMock()
         proxy.prompt_to_server["github__summarize"] = PromptMapping(
-            server_name="github", client=client,
+            server_name="github",
+            client=client,
             prompt=_make_prompt("summarize"),
         )
         proxy.prompt_to_server["slack__notify"] = PromptMapping(
-            server_name="slack", client=client,
+            server_name="slack",
+            client=client,
             prompt=_make_prompt("notify"),
         )
         result = await proxy._list_prompts(None)
@@ -82,13 +71,14 @@ class TestGetPrompt:
         )
         client.get_prompt = AsyncMock(return_value=expected_result)
         proxy.prompt_to_server["github__summarize"] = PromptMapping(
-            server_name="github", client=client,
+            server_name="github",
+            client=client,
             prompt=_make_prompt("summarize"),
         )
         req = MagicMock()
         req.params.name = "github__summarize"
         req.params.arguments = {"repo": "test"}
-        result = await proxy._get_prompt(req)
+        await proxy._get_prompt(req)
         # Verify backend was called with original (un-namespaced) name
         client.get_prompt.assert_called_once_with("summarize", {"repo": "test"})
 
@@ -106,7 +96,8 @@ class TestGetPrompt:
         client = AsyncMock()
         client.get_prompt = AsyncMock(side_effect=RuntimeError("connection lost"))
         proxy.prompt_to_server["github__summarize"] = PromptMapping(
-            server_name="github", client=client,
+            server_name="github",
+            client=client,
             prompt=_make_prompt("summarize"),
         )
         req = MagicMock()
@@ -119,7 +110,8 @@ class TestGetPrompt:
     async def test_prompt_with_none_client_returns_error(self):
         proxy = _make_proxy()
         proxy.prompt_to_server["github__summarize"] = PromptMapping(
-            server_name="github", client=None,
+            server_name="github",
+            client=None,
             prompt=_make_prompt("summarize"),
         )
         req = MagicMock()
@@ -138,7 +130,8 @@ class TestListResources:
         proxy = _make_proxy()
         client = AsyncMock()
         proxy.resource_to_server["file:///data.csv"] = ResourceMapping(
-            server_name="filesystem", client=client,
+            server_name="filesystem",
+            client=client,
             resource=_make_resource("data.csv", "file:///data.csv"),
         )
         result = await proxy._list_resources(None)
@@ -160,11 +153,13 @@ class TestListResources:
         proxy = _make_proxy()
         client = AsyncMock()
         proxy.resource_to_server["file:///a.txt"] = ResourceMapping(
-            server_name="fs1", client=client,
+            server_name="fs1",
+            client=client,
             resource=_make_resource("a.txt", "file:///a.txt"),
         )
         proxy.resource_to_server["https://api.example.com/data"] = ResourceMapping(
-            server_name="api", client=client,
+            server_name="api",
+            client=client,
             resource=_make_resource("data", "https://api.example.com/data"),
         )
         result = await proxy._list_resources(None)
@@ -178,11 +173,16 @@ class TestReadResource:
         proxy = _make_proxy()
         client = AsyncMock()
         read_result = types.ReadResourceResult(
-            contents=[types.TextResourceContents(uri="file:///data.csv", text="data", mimeType="text/plain")]
+            contents=[
+                types.TextResourceContents(
+                    uri="file:///data.csv", text="data", mimeType="text/plain"
+                )
+            ]
         )
         client.read_resource = AsyncMock(return_value=read_result)
         proxy.resource_to_server["file:///data.csv"] = ResourceMapping(
-            server_name="fs", client=client,
+            server_name="fs",
+            client=client,
             resource=_make_resource("data.csv", "file:///data.csv"),
         )
         req = MagicMock()
@@ -205,7 +205,8 @@ class TestReadResource:
         client = AsyncMock()
         client.read_resource = AsyncMock(side_effect=RuntimeError("timeout"))
         proxy.resource_to_server["file:///data.csv"] = ResourceMapping(
-            server_name="fs", client=client,
+            server_name="fs",
+            client=client,
             resource=_make_resource("data.csv", "file:///data.csv"),
         )
         req = MagicMock()
@@ -224,7 +225,8 @@ class TestSubscribeResource:
         client = AsyncMock()
         client.subscribe_resource = AsyncMock()
         proxy.resource_to_server["file:///watch.log"] = ResourceMapping(
-            server_name="fs", client=client,
+            server_name="fs",
+            client=client,
             resource=_make_resource("watch.log", "file:///watch.log"),
         )
         req = MagicMock()
@@ -250,7 +252,8 @@ class TestSubscribeResource:
             side_effect=RuntimeError("subscribe failed")
         )
         proxy.resource_to_server["file:///watch.log"] = ResourceMapping(
-            server_name="fs", client=client,
+            server_name="fs",
+            client=client,
             resource=_make_resource("watch.log", "file:///watch.log"),
         )
         req = MagicMock()
@@ -266,7 +269,8 @@ class TestUnsubscribeResource:
         client = AsyncMock()
         client.unsubscribe_resource = AsyncMock()
         proxy.resource_to_server["file:///watch.log"] = ResourceMapping(
-            server_name="fs", client=client,
+            server_name="fs",
+            client=client,
             resource=_make_resource("watch.log", "file:///watch.log"),
         )
         req = MagicMock()
@@ -287,7 +291,8 @@ class TestUnsubscribeResource:
     async def test_none_client_returns_error(self):
         proxy = _make_proxy()
         proxy.resource_to_server["file:///watch.log"] = ResourceMapping(
-            server_name="fs", client=None,
+            server_name="fs",
+            client=None,
             resource=_make_resource("watch.log", "file:///watch.log"),
         )
         req = MagicMock()

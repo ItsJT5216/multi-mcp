@@ -1,13 +1,15 @@
 """Integration tests for retrieval pipeline in MCPProxyServer."""
-import pytest
+
 from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 from mcp import types
 from src.multimcp.mcp_proxy import MCPProxyServer
-from src.multimcp.retrieval.pipeline import RetrievalPipeline
 from src.multimcp.retrieval.base import PassthroughRetriever
 from src.multimcp.retrieval.logging import NullLogger
-from src.multimcp.retrieval.session import SessionStateManager
 from src.multimcp.retrieval.models import RetrievalConfig
+from src.multimcp.retrieval.pipeline import RetrievalPipeline
+from src.multimcp.retrieval.session import SessionStateManager
 
 
 def _make_tool(name: str) -> types.Tool:
@@ -18,36 +20,27 @@ def _make_tool(name: str) -> types.Tool:
     )
 
 
+def _make_proxy(pipeline=None):
+    with patch("src.multimcp.mcp_proxy.AuditLogger"):
+        proxy = MCPProxyServer(MagicMock())
+    proxy.trigger_manager.check_and_enable = AsyncMock(return_value=[])
+    proxy.retrieval_pipeline = pipeline
+    proxy._server_session = MagicMock() if pipeline is not None else None
+    return proxy
+
+
 class TestProxyPipelineIntegration:
     """Test MCPProxyServer integration with retrieval pipeline."""
 
     def _make_proxy(self, pipeline=None):
-        """Create a minimal MCPProxyServer bypassing __init__ for unit testing."""
-        proxy = MCPProxyServer.__new__(MCPProxyServer)
-        proxy.tool_to_server = {}
-        proxy.prompt_to_server = {}
-        proxy.resource_to_server = {}
-        proxy._resource_objects = {}
-        proxy.client_manager = MagicMock()
-        proxy.trigger_manager = MagicMock()
-        proxy.trigger_manager.check_and_enable = AsyncMock(return_value=[])
-        proxy.audit_logger = MagicMock()
-        proxy.logger = MagicMock()
-        proxy._register_lock = MagicMock()
-        proxy._register_lock.__aenter__ = AsyncMock()
-        proxy._register_lock.__aexit__ = AsyncMock()
-        proxy.retrieval_pipeline = pipeline
-        # Phase 8: session tracking attributes (required by _get_session_id)
-        proxy._server_session = MagicMock() if pipeline is not None else None
-        proxy._session_ids = {}
-        proxy._last_tool_list_hash = {}
-        return proxy
+        return _make_proxy(pipeline)
 
     @pytest.mark.asyncio
     async def test_list_tools_without_pipeline(self):
         """Without pipeline (None), _list_tools returns all tools including cached."""
         proxy = self._make_proxy(pipeline=None)
         from src.multimcp.mcp_proxy import ToolMapping
+
         proxy.tool_to_server["github__get_me"] = ToolMapping(
             server_name="github",
             client=MagicMock(),
@@ -69,6 +62,7 @@ class TestProxyPipelineIntegration:
         )
         proxy = self._make_proxy(pipeline=pipeline)
         from src.multimcp.mcp_proxy import ToolMapping
+
         proxy.tool_to_server["github__get_me"] = ToolMapping(
             server_name="github",
             client=MagicMock(),
@@ -100,6 +94,7 @@ class TestProxyPipelineIntegration:
         )
         proxy = self._make_proxy(pipeline=pipeline)
         from src.multimcp.mcp_proxy import ToolMapping
+
         proxy.tool_to_server["github__get_me"] = ToolMapping(
             server_name="github",
             client=MagicMock(),
@@ -115,7 +110,7 @@ class TestProxyPipelineIntegration:
         # Phase 2: small registry (2 tools) → all tools returned
         non_routing = [t for t in result.root.tools if t.name != "request_tool"]
         assert len(non_routing) <= 20  # core invariant
-        assert len(non_routing) >= 1   # at least one tool
+        assert len(non_routing) >= 1  # at least one tool
 
     @pytest.mark.asyncio
     async def test_pipeline_attribute_exists_after_init(self):
@@ -134,27 +129,11 @@ class TestCallToolPipelineNotification:
     """Test that _call_tool notifies pipeline after successful calls."""
 
     def _make_proxy_with_tool(self, pipeline=None):
-        proxy = MCPProxyServer.__new__(MCPProxyServer)
-        proxy.tool_to_server = {}
-        proxy.prompt_to_server = {}
-        proxy.resource_to_server = {}
-        proxy._resource_objects = {}
-        proxy.client_manager = MagicMock()
-        proxy.trigger_manager = MagicMock()
-        proxy.trigger_manager.check_and_enable = AsyncMock(return_value=[])
-        proxy.audit_logger = MagicMock()
-        proxy.logger = MagicMock()
-        proxy._register_lock = MagicMock()
-        proxy._register_lock.__aenter__ = AsyncMock()
-        proxy._register_lock.__aexit__ = AsyncMock()
-        proxy.retrieval_pipeline = pipeline
-        # Phase 8: session tracking attributes required by _get_session_id
-        proxy._server_session = MagicMock() if pipeline is not None else None
-        proxy._session_ids = {}
-        proxy._last_tool_list_hash = {}
+        proxy = _make_proxy(pipeline)
 
         # Add a connected tool
         from src.multimcp.mcp_proxy import ToolMapping
+
         mock_client = MagicMock()
         mock_result = MagicMock()
         mock_result.content = [types.TextContent(type="text", text="ok")]
@@ -170,7 +149,8 @@ class TestCallToolPipelineNotification:
     @pytest.mark.asyncio
     async def test_call_tool_notifies_pipeline(self):
         """on_tool_called should be invoked after a successful tool call."""
-        from unittest.mock import call, ANY
+        from unittest.mock import ANY
+
         config = RetrievalConfig(enabled=True)
         pipeline = RetrievalPipeline(
             retriever=PassthroughRetriever(),

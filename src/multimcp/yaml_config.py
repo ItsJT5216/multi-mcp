@@ -1,6 +1,8 @@
 from __future__ import annotations
+
 from pathlib import Path
 from typing import Literal, Optional
+
 import yaml
 from pydantic import BaseModel, Field, ValidationError
 from src.utils.logger import get_logger
@@ -48,6 +50,7 @@ class ServerConfig(BaseModel):
 
 class RetrievalSettings(BaseModel):
     """Configuration for the intelligent tool retrieval pipeline."""
+
     enabled: bool = False
     top_k: int = Field(default=15, ge=1)
     full_description_count: int = Field(default=3, ge=0)
@@ -68,6 +71,7 @@ class RetrievalSettings(BaseModel):
 
 class ProfileConfig(BaseModel):
     """Per-profile tool allow-list. Keys are server names, values are lists of allowed tool names."""
+
     servers: dict[str, list[str]] = Field(default_factory=dict)
 
 

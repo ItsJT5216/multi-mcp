@@ -1,6 +1,10 @@
 import sys
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
+
 from loguru import logger
+
+if TYPE_CHECKING:
+    from loguru import Logger
 
 # Global namespace for all loggers
 BASE_LOGGER_NAMESPACE = "multi_mcp"
@@ -9,7 +13,7 @@ BASE_LOGGER_NAMESPACE = "multi_mcp"
 _configured = False
 
 
-def get_logger(name: str) -> "logger":
+def get_logger(name: str) -> "Logger":
     """
     Returns a loguru logger bound with the given module name.
 
