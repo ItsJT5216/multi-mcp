@@ -1092,8 +1092,7 @@ class MultiMCP:
                     {"error": "Missing client name in path"}, status_code=400
                 )
 
-            client = self.proxy.client_manager.clients.get(name)
-            if not client:
+            if not self.proxy.has_configured_server(name):
                 return JSONResponse(
                     {"error": f"No client named '{name}'"}, status_code=404
                 )

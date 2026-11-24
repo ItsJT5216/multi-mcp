@@ -364,6 +364,46 @@ def test_catalog_limit_rejects_before_registry_copy():
 
 
 @pytest.mark.asyncio
+async def test_oversized_tools_catalog_is_skipped_not_raised():
+    """An oversized tools catalog is logged and skipped so registration completes."""
+    manager = MCPClientManager()
+    manager.server_configs["svc"] = {"max_catalog_items": 2}
+    proxy = MCPProxyServer(manager)
+    client = MagicMock()
+    client.list_tools = AsyncMock(
+        return_value=types.ListToolsResult(
+            tools=[
+                types.Tool(name=f"t{i}", inputSchema={"type": "object"})
+                for i in range(3)
+            ]
+        )
+    )
+
+    tools = await proxy._initialize_tools_for_client("svc", client)
+
+    assert tools == []
+    assert not any(k.startswith("svc__") for k in proxy.tool_to_server)
+
+
+@pytest.mark.asyncio
+async def test_unregister_clears_unconnected_server_config():
+    """Pending-only servers can be unregistered, freeing backend quota."""
+    manager = MCPClientManager()
+    manager.server_configs["gone"] = {"command": "x"}
+    manager.pending_configs["gone"] = {"command": "x"}
+    manager.tool_filters["gone"] = {"allow": ["*"]}
+    proxy = MCPProxyServer(manager)
+
+    assert proxy.has_configured_server("gone")
+    await proxy.unregister_client("gone")
+
+    assert "gone" not in manager.server_configs
+    assert "gone" not in manager.pending_configs
+    assert "gone" not in manager.tool_filters
+    assert not proxy.has_configured_server("gone")
+
+
+@pytest.mark.asyncio
 async def test_slow_backend_times_out_e2e():
     """E2E proof: a hung backend returns an isError timeout response quickly
     (instead of stalling forever) and the failure counts toward the circuit

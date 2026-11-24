@@ -271,7 +271,11 @@ class MCPProxyServer(server.Server):
         async with self._register_lock:
             client = self.client_manager.clients.get(name)
             if not client:
-                self.logger.warning(f"⚠️ Tried to unregister unknown client: {name}")
+                if self.has_configured_server(name):
+                    self._forget_server_config(name)
+                    self.logger.info(f"✅ Removed unconnected server config '{name}'.")
+                else:
+                    self.logger.warning(f"⚠️ Tried to unregister unknown client: {name}")
                 return
 
             # Check if client had tools capability before removing
@@ -300,13 +304,7 @@ class MCPProxyServer(server.Server):
             self.logger.info(f"✅ Client '{name}' fully unregistered.")
 
             # Clean up client manager runtime state for this server
-            if self.client_manager:
-                self.client_manager.pending_configs.pop(name, None)
-                self.client_manager.server_configs.pop(name, None)
-                self.client_manager.tool_filters.pop(name, None)
-                self.client_manager.idle_timeouts.pop(name, None)
-                self.client_manager.last_used.pop(name, None)
-                self.client_manager._creation_locks.pop(name, None)
+            self._forget_server_config(name)
 
             # Send notifications for removed capabilities
             if had_tools:
@@ -319,6 +317,28 @@ class MCPProxyServer(server.Server):
             had_resources = caps and caps.resources if caps else False
             if had_resources:
                 await self._send_resources_list_changed()
+
+    def has_configured_server(self, name: str) -> bool:
+        """Return True when a server name is connected, pending, or configured."""
+        if not self.client_manager:
+            return False
+        return (
+            name in self.client_manager.clients
+            or name in self.client_manager.pending_configs
+            or name in self.client_manager.server_configs
+        )
+
+    def _forget_server_config(self, name: str) -> None:
+        """Drop client manager config and runtime state for a server name."""
+        if not self.client_manager:
+            return
+        self.client_manager.pending_configs.pop(name, None)
+        self.client_manager.server_configs.pop(name, None)
+        self.client_manager.tool_filters.pop(name, None)
+        self.client_manager.idle_timeouts.pop(name, None)
+        self.client_manager.last_used.pop(name, None)
+        self.client_manager._creation_locks.pop(name, None)
+
     async def toggle_tool(self, server_name: str, tool_name: str, enabled: bool) -> dict:
         """Enable or disable a single tool at runtime without restarting the server.
 
@@ -914,7 +934,11 @@ class MCPProxyServer(server.Server):
         tools_result = await self._run_backend_operation(
             server_name, "tools/list", client.list_tools
         )
-        self._ensure_catalog_size(server_name, "tools", tools_result.tools)
+        try:
+            self._ensure_catalog_size(server_name, "tools", tools_result.tools)
+        except ValueError as e:
+            self.logger.warning(f"⚠️ Skipping tools for '{server_name}': {e}")
+            return tool_list
         for tool in tools_result.tools:
             if not self._is_tool_allowed(tool.name, tool_filter):
                 self.logger.debug(
