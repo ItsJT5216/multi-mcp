@@ -1,30 +1,74 @@
 import asyncio
-import anyio
 import hmac
+import json
 import os
 import signal
-import uvicorn
-import json
+import sys
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Literal, Any, Optional
-from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import BaseModel, Field, ValidationError
+from typing import Any, Literal, Optional
 
-from mcp.server.stdio import stdio_server
-from starlette.applications import Starlette
-from starlette.routing import Route, Mount
-from starlette.requests import Request
-from starlette.responses import JSONResponse
-
+import anyio
+import uvicorn
 from mcp.server.sse import SseServerTransport
-
+from mcp.server.stdio import stdio_server
+from pydantic import ValidationError
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from src.multimcp.cache_manager import get_enabled_tools, merge_discovered_tools
 from src.multimcp.mcp_client import MCPClientManager, _validate_url
 from src.multimcp.mcp_proxy import MCPProxyServer
-from src.multimcp.yaml_config import load_config, save_config, MultiMCPConfig, ServerConfig
-from src.multimcp.cache_manager import merge_discovered_tools, get_enabled_tools
+from src.multimcp.yaml_config import (
+    MultiMCPConfig,
+    ServerConfig,
+    load_config,
+    save_config,
+)
 from src.utils.logger import configure_logging, get_logger
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+from starlette.routing import Mount, Route
+
+if sys.version_info < (3, 11):
+    from exceptiongroup import ExceptionGroup
+else:
+    from builtins import ExceptionGroup
 
 YAML_CONFIG_PATH = Path.home() / ".config" / "multi-mcp" / "servers.yaml"
+MAX_HTTP_REQUEST_BODY_BYTES = 1024 * 1024
+MAX_CONCURRENT_HTTP_REQUESTS = 128
+MAX_CONFIGURED_BACKENDS = 100
+
+
+class RequestBodyTooLarge(ValueError):
+    """Raised before an HTTP request body can grow beyond the configured cap."""
+
+
+def _content_length_exceeds(scope: Mapping[str, Any], limit: int) -> bool:
+    """Reject a declared oversized body without reading it from the ASGI server."""
+    for name, value in scope.get("headers", []):
+        if name.lower() != b"content-length":
+            continue
+        try:
+            return int(value) > limit
+        except ValueError:
+            return False
+    return False
+
+
+async def _read_bounded_json(
+    request: Request, limit: int = MAX_HTTP_REQUEST_BODY_BYTES
+) -> Any:
+    """Read and decode JSON while enforcing the limit for streamed bodies too."""
+    if _content_length_exceeds(request.scope, limit):
+        raise RequestBodyTooLarge(f"Request body exceeds {limit} bytes")
+
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > limit:
+            raise RequestBodyTooLarge(f"Request body exceeds {limit} bytes")
+        body.extend(chunk)
+    return json.loads(body)
 
 
 class MCPSettings(BaseSettings):
@@ -35,13 +79,16 @@ class MCPSettings(BaseSettings):
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
     transport: Literal["stdio", "sse"] = "stdio"
     sse_server_debug: bool = False
-    debug: bool = False  # Expose exception details in error responses (env: MULTI_MCP_DEBUG)
+    debug: bool = (
+        False  # Expose exception details in error responses (env: MULTI_MCP_DEBUG)
+    )
     config: Optional[str] = None
     api_key: Optional[str] = None  # API key for authentication (env: MULTI_MCP_API_KEY)
-    profile: Optional[str] = None  # Named profile for tool filtering (env: MULTI_MCP_PROFILE)
+    profile: Optional[str] = (
+        None  # Named profile for tool filtering (env: MULTI_MCP_PROFILE)
+    )
 
     model_config = SettingsConfigDict(env_prefix="MULTI_MCP_")
-
 
 
 class MultiMCP:
@@ -68,7 +115,9 @@ class MultiMCP:
         if not task.cancelled():
             exc = task.exception()
             if exc:
-                self.logger.error(f"❌ Background task '{task.get_name()}' failed: {exc}")
+                self.logger.error(
+                    f"❌ Background task '{task.get_name()}' failed: {exc}"
+                )
 
     @property
     def auth_enabled(self) -> bool:
@@ -87,19 +136,27 @@ class MultiMCP:
             # Merge any new servers from JSON that aren't in YAML yet
             new_servers = self._find_new_json_servers(config)
             if new_servers:
-                self.logger.info(f"🔍 Found {len(new_servers)} new server(s) in JSON config: {', '.join(new_servers)}")
-                config = await self._discover_new_servers(config, new_servers, yaml_path)
+                self.logger.info(
+                    f"🔍 Found {len(new_servers)} new server(s) in JSON config: {', '.join(new_servers)}"
+                )
+                config = await self._discover_new_servers(
+                    config, new_servers, yaml_path
+                )
 
         # Apply tool filters, idle timeouts, and always_on settings
         for server_name, server_config in config.servers.items():
             enabled = get_enabled_tools(config, server_name)
             if enabled:
                 self.client_manager.tool_filters[server_name] = {
-                    "allow": list(enabled), "deny": []
+                    "allow": list(enabled),
+                    "deny": [],
                 }
             else:
                 # All tools disabled — explicit deny-all filter
-                self.client_manager.tool_filters[server_name] = {"allow": [], "deny": ["*"]}
+                self.client_manager.tool_filters[server_name] = {
+                    "allow": [],
+                    "deny": ["*"],
+                }
             self.client_manager.idle_timeouts[server_name] = (
                 server_config.idle_timeout_minutes * 60
             )
@@ -108,7 +165,9 @@ class MultiMCP:
 
         return config
 
-    def _resolve_profile(self, profile_name: str, yaml_config: MultiMCPConfig) -> dict[str, dict]:
+    def _resolve_profile(
+        self, profile_name: str, yaml_config: MultiMCPConfig
+    ) -> dict[str, dict]:
         """Convert a profile name into per-server tool filters (allow-list)."""
         profile = yaml_config.profiles.get(profile_name)
         if not profile:
@@ -134,7 +193,9 @@ class MultiMCP:
             json_servers.update(self._extract_mcp_servers(json_config))
         plugin_servers = self._scan_claude_plugins()
         if plugin_servers:
-            self.logger.info(f"🔌 Found {len(plugin_servers)} server(s) from Claude plugins")
+            self.logger.info(
+                f"🔌 Found {len(plugin_servers)} server(s) from Claude plugins"
+            )
             for name, srv in plugin_servers.items():
                 if name not in json_servers:
                     json_servers[name] = srv
@@ -150,7 +211,9 @@ class MultiMCP:
             filtered = {k: v for k, v in srv.items() if k in valid_fields}
             ignored = set(srv.keys()) - set(filtered.keys())
             if ignored:
-                self.logger.warning(f"⚠️ '{name}': ignoring unknown config keys: {ignored}")
+                self.logger.warning(
+                    f"⚠️ '{name}': ignoring unknown config keys: {ignored}"
+                )
             config.servers[name] = ServerConfig(**filtered)
 
         discovered = await self.client_manager.discover_all(config)
@@ -228,11 +291,17 @@ class MultiMCP:
         # Each tuple is (label, path)
         candidates: list[tuple[str, Path]] = [
             # Claude Desktop
-            ("Claude Desktop", home / ".config" / "Claude" / "claude_desktop_config.json"),
+            (
+                "Claude Desktop",
+                home / ".config" / "Claude" / "claude_desktop_config.json",
+            ),
             ("Claude Desktop", app_support / "Claude" / "claude_desktop_config.json"),
             # VSCode / VSCode Insiders (dedicated MCP file, uses "servers" key)
             ("VSCode", home / ".config" / "Code" / "User" / "mcp.json"),
-            ("VSCode Insiders", home / ".config" / "Code - Insiders" / "User" / "mcp.json"),
+            (
+                "VSCode Insiders",
+                home / ".config" / "Code - Insiders" / "User" / "mcp.json",
+            ),
             ("VSCode", app_support / "Code" / "User" / "mcp.json"),
             # Cursor
             ("Cursor", home / ".cursor" / "mcp.json"),
@@ -290,12 +359,14 @@ class MultiMCP:
         filtered = {k: v for k, v in servers.items() if k not in excluded}
         skipped = excluded & servers.keys()
         if skipped:
-            self.logger.info(f"⛔ Skipping excluded servers: {', '.join(sorted(skipped))}")
+            self.logger.info(
+                f"⛔ Skipping excluded servers: {', '.join(sorted(skipped))}"
+            )
         return filtered
 
     def _scan_claude_plugins(self) -> dict[str, dict]:
         """Scan Claude Code plugin cache for active MCP server configs.
-        
+
         NOTE: This method is Claude Code-specific. It reads from ~/.claude/plugins/cache
         and ~/.claude/settings.local.json, which only exist when running inside
         Claude Code (Anthropic's coding assistant). This behavior is controlled by the
@@ -359,8 +430,11 @@ class MultiMCP:
             # Auto-discover from configured sources
             if config.sources:
                 MCP_CONFIG_NAMES = [
-                    "mcp.json", ".mcp.json", "mcp-config.json",
-                    "mcp_config.json", "claude_desktop_config.json",
+                    "mcp.json",
+                    ".mcp.json",
+                    "mcp-config.json",
+                    "mcp_config.json",
+                    "claude_desktop_config.json",
                 ]
                 for source_path in config.sources:
                     expanded = os.path.expanduser(source_path)
@@ -381,15 +455,21 @@ class MultiMCP:
                                 data = json.load(f)
                             servers = self._extract_mcp_servers(data)
                             if servers:
-                                self.logger.info(f"📂 Found {len(servers)} server(s) in {filepath}")
+                                self.logger.info(
+                                    f"📂 Found {len(servers)} server(s) in {filepath}"
+                                )
                                 all_json_servers.update(servers)
                         except (json.JSONDecodeError, OSError) as e:
-                            self.logger.warning(f"⚠️ Failed to read source {filepath}: {e}")
+                            self.logger.warning(
+                                f"⚠️ Failed to read source {filepath}: {e}"
+                            )
 
             # Always scan Claude Code plugin cache
             plugin_servers = self._scan_claude_plugins()
             if plugin_servers:
-                self.logger.info(f"🔌 Found {len(plugin_servers)} server(s) from Claude plugins")
+                self.logger.info(
+                    f"🔌 Found {len(plugin_servers)} server(s) from Claude plugins"
+                )
                 for name, srv in plugin_servers.items():
                     if name not in all_json_servers:
                         all_json_servers[name] = srv
@@ -411,7 +491,9 @@ class MultiMCP:
                 filtered = {k: v for k, v in srv.items() if k in valid_fields}
                 ignored = set(srv.keys()) - set(filtered.keys())
                 if ignored:
-                    self.logger.warning(f"⚠️ '{name}': ignoring unknown config keys: {ignored}")
+                    self.logger.warning(
+                        f"⚠️ '{name}': ignoring unknown config keys: {ignored}"
+                    )
                 new_servers[name] = ServerConfig(**filtered)
         return new_servers
 
@@ -431,7 +513,9 @@ class MultiMCP:
 
         if discovered:
             save_config(config, yaml_path)
-            self.logger.info(f"\U0001f4dd Updated config with new servers at {yaml_path}")
+            self.logger.info(
+                f"\U0001f4dd Updated config with new servers at {yaml_path}"
+            )
         return config
 
     def _build_config_from_json_file(self) -> MultiMCPConfig:
@@ -452,7 +536,9 @@ class MultiMCP:
             filtered = {k: v for k, v in srv.items() if k in valid_fields}
             ignored = set(srv.keys()) - set(filtered.keys())
             if ignored:
-                self.logger.warning(f"⚠️ '{name}': ignoring unknown config keys: {ignored}")
+                self.logger.warning(
+                    f"⚠️ '{name}': ignoring unknown config keys: {ignored}"
+                )
             config.servers[name] = ServerConfig(**filtered)
         # Apply idle timeouts and always_on settings.
         # NOTE: Do NOT set tool_filters here — no tool discovery has been done yet.
@@ -466,6 +552,7 @@ class MultiMCP:
         # Parse retrieval settings from JSON if present.
         if "retrieval" in json_data:
             from src.multimcp.yaml_config import RetrievalSettings
+
             try:
                 config.retrieval = RetrievalSettings(**json_data["retrieval"])
             except ValidationError as e:
@@ -487,17 +574,22 @@ class MultiMCP:
         semaphore) so startup latency is the slowest server, not the sum of all
         servers. Failures are isolated per server.
         """
+
         async def _connect_one(server_name: str) -> None:
             try:
                 client = await self.client_manager.get_or_create_client(server_name)
                 if self.proxy:
                     await self.proxy.initialize_single_client(server_name, client)
                     if self.proxy.retrieval_pipeline is not None:
-                        self.proxy.retrieval_pipeline.rebuild_catalog(self.proxy.tool_to_server)
+                        self.proxy.retrieval_pipeline.rebuild_catalog(
+                            self.proxy.tool_to_server
+                        )
                     await self.proxy._send_tools_list_changed()
                     self.logger.info(f"✅ Always-on server '{server_name}' connected")
             except Exception as e:
-                self.logger.warning(f"⚠️ Always-on '{server_name}' failed to connect: {e}")
+                self.logger.warning(
+                    f"⚠️ Always-on '{server_name}' failed to connect: {e}"
+                )
 
         await asyncio.gather(
             *(
@@ -514,6 +606,7 @@ class MultiMCP:
         startup latency is the slowest server, not the sum of all servers.
         Failures are isolated per server (logged, others still connect).
         """
+
         async def _connect_one(server_name: str) -> None:
             try:
                 client = await self.client_manager.get_or_create_client(server_name)
@@ -540,7 +633,9 @@ class MultiMCP:
         else:
             yaml_config = await self._bootstrap_from_yaml(YAML_CONFIG_PATH)
         self._yaml_config = yaml_config  # Store for profile resolution
-        self._yaml_config_cache = yaml_config  # available to toggle_tool for schema lookup
+        self._yaml_config_cache = (
+            yaml_config  # available to toggle_tool for schema lookup
+        )
 
         # Register ALL servers as pending — proxy starts instantly from YAML cache
         # NOTE(M10): model_dump(exclude_none=True) strips fields set to None.
@@ -553,10 +648,14 @@ class MultiMCP:
 
         # Apply CLI profile if specified (stdio transport gets it applied globally)
         if self.settings.profile and self._yaml_config:
-            profile_filters = self._resolve_profile(self.settings.profile, self._yaml_config)
+            profile_filters = self._resolve_profile(
+                self.settings.profile, self._yaml_config
+            )
             if profile_filters:
                 self.client_manager.tool_filters.update(profile_filters)
-                self.logger.info(f"🎭 Applied profile '{self.settings.profile}' for stdio session")
+                self.logger.info(
+                    f"🎭 Applied profile '{self.settings.profile}' for stdio session"
+                )
 
         # Register signal handlers for graceful shutdown
         loop = asyncio.get_running_loop()
@@ -579,28 +678,35 @@ class MultiMCP:
             for name, srv in yaml_config.servers.items()
             if srv.always_on
         }
-        self._track_task(self.client_manager.start_always_on_watchdog(always_on_configs), "always-on-watchdog")
+        self._track_task(
+            self.client_manager.start_always_on_watchdog(always_on_configs),
+            "always-on-watchdog",
+        )
 
         try:
             self.proxy = await MCPProxyServer.create(self.client_manager)
-            self.client_manager._on_server_disconnected = self.proxy._on_server_disconnected
+            self.client_manager._on_server_disconnected = (
+                self.proxy._on_server_disconnected
+            )
 
             # Initialize retrieval pipeline from YAML config.
             # yaml_config is the MultiMCPConfig local variable loaded earlier in run().
             # self.config is MCPSettings (BaseSettings) and does NOT have a retrieval field.
             # When no retrieval: block appears in YAML, RetrievalSettings() defaults apply
             # (enabled=False, shadow_mode=False) — preserving full backward compatibility.
-            from src.multimcp.retrieval.pipeline import RetrievalPipeline
+            from src.multimcp.retrieval.base import PassthroughRetriever
             from src.multimcp.retrieval.bmx_retriever import BMXFRetriever
             from src.multimcp.retrieval.keyword import KeywordRetriever
-            from src.multimcp.retrieval.base import PassthroughRetriever
-            from src.multimcp.retrieval.logging import NullLogger, FileRetrievalLogger
-            from src.multimcp.retrieval.session import SessionStateManager
-            from src.multimcp.retrieval.models import RetrievalConfig
+            from src.multimcp.retrieval.logging import FileRetrievalLogger, NullLogger
             from src.multimcp.retrieval.metrics import RollingMetrics
+            from src.multimcp.retrieval.models import RetrievalConfig
+            from src.multimcp.retrieval.pipeline import RetrievalPipeline
+            from src.multimcp.retrieval.session import SessionStateManager
 
             # Build RetrievalConfig from YAML settings.
-            yaml_retrieval = yaml_config.retrieval  # RetrievalSettings — defaults to enabled=False when absent
+            yaml_retrieval = (
+                yaml_config.retrieval
+            )  # RetrievalSettings — defaults to enabled=False when absent
             retrieval_config = RetrievalConfig(
                 enabled=yaml_retrieval.enabled,
                 top_k=yaml_retrieval.top_k,
@@ -638,6 +744,7 @@ class MultiMCP:
             telemetry_scanner = None
             try:
                 from src.multimcp.retrieval.telemetry.scanner import TelemetryScanner
+
                 telemetry_scanner = TelemetryScanner()
             except Exception as _te:
                 self.logger.warning(f"⚠️ TelemetryScanner unavailable: {_te}")
@@ -656,7 +763,11 @@ class MultiMCP:
                 retrieval_logger = NullLogger()
 
             # RollingMetrics — created only when pipeline is enabled (required for rescore alerting).
-            rolling_metrics = RollingMetrics(window_seconds=1800) if retrieval_config.enabled else None
+            rolling_metrics = (
+                RollingMetrics(window_seconds=1800)
+                if retrieval_config.enabled
+                else None
+            )
 
             self.proxy.retrieval_pipeline = RetrievalPipeline(
                 retriever=retriever,
@@ -685,7 +796,9 @@ class MultiMCP:
                     rebuild = getattr(active_retriever, "rebuild_index", None)
                     if rebuild is not None:
                         rebuild(self.proxy.tool_to_server)
-                    self.proxy.retrieval_pipeline.rebuild_catalog(self.proxy.tool_to_server)
+                    self.proxy.retrieval_pipeline.rebuild_catalog(
+                        self.proxy.tool_to_server
+                    )
 
             # Register watchdog callback so proxy tool mappings are refreshed after reconnect
             async def _on_server_reconnected(server_name: str, client) -> None:
@@ -693,16 +806,24 @@ class MultiMCP:
                 try:
                     await self.proxy.initialize_single_client(server_name, client)
                     if self.proxy.retrieval_pipeline is not None:
-                        self.proxy.retrieval_pipeline.rebuild_catalog(self.proxy.tool_to_server)
+                        self.proxy.retrieval_pipeline.rebuild_catalog(
+                            self.proxy.tool_to_server
+                        )
                     await self.proxy._send_tools_list_changed()
-                    self.logger.info(f"✅ Proxy updated after watchdog reconnect of '{server_name}'")
+                    self.logger.info(
+                        f"✅ Proxy updated after watchdog reconnect of '{server_name}'"
+                    )
                 except Exception as e:
-                    self.logger.warning(f"⚠️ Failed to update proxy after reconnect of '{server_name}': {e}")
+                    self.logger.warning(
+                        f"⚠️ Failed to update proxy after reconnect of '{server_name}': {e}"
+                    )
 
             self.client_manager.on_server_reconnected = _on_server_reconnected
 
             # Connect always_on servers in background (don't block startup)
-            self._track_task(self._connect_always_on_servers(yaml_config), "connect-always-on")
+            self._track_task(
+                self._connect_always_on_servers(yaml_config), "connect-always-on"
+            )
 
             # Wait for server or shutdown signal
             server_task = asyncio.create_task(self.start_server())
@@ -738,7 +859,7 @@ class MultiMCP:
     def _check_auth(self, request: Request) -> Optional[JSONResponse]:
         """
         Check if request is authenticated.
-        
+
         Accepts Authorization: Bearer <token> header (preferred) or
         ?token=<key> query parameter (deprecated fallback for SSE).
         Returns None if authenticated, JSONResponse with 401 if not.
@@ -759,7 +880,9 @@ class MultiMCP:
             token = auth_header[7:]  # Remove "Bearer " prefix
             if hmac.compare_digest(token, self.settings.api_key):
                 return None  # Valid token
-            return JSONResponse({"error": "Unauthorized: Invalid API key"}, status_code=401)
+            return JSONResponse(
+                {"error": "Unauthorized: Invalid API key"}, status_code=401
+            )
 
         # Deprecated fallback: query parameter for SSE endpoint
         if request.url.path == "/sse":
@@ -819,6 +942,7 @@ class MultiMCP:
         class _SSEHandler:
             """Raw ASGI handler for SSE — bypasses Starlette's request_response wrapper
             which would TypeError when handle_sse returns None after streaming."""
+
             def __init__(self, multi_mcp_instance, sse_transport):
                 self._mcp = multi_mcp_instance
                 self._sse = sse_transport
@@ -833,14 +957,24 @@ class MultiMCP:
                 # Profile-based filtering: overlay per-session tool filters.
                 # NOTE: save/restore is NOT concurrent-safe. Acceptable for single-user
                 # personal server; for multi-user deployments, use per-session filter copies.
-                profile_name = request.query_params.get("profile") or self._mcp.settings.profile
+                profile_name = (
+                    request.query_params.get("profile") or self._mcp.settings.profile
+                )
                 saved_filters = None
                 if profile_name and self._mcp._yaml_config:
-                    profile_filters = self._mcp._resolve_profile(profile_name, self._mcp._yaml_config)
+                    profile_filters = self._mcp._resolve_profile(
+                        profile_name, self._mcp._yaml_config
+                    )
                     if profile_filters:
-                        saved_filters = dict(self._mcp.proxy.client_manager.tool_filters)
-                        self._mcp.proxy.client_manager.tool_filters.update(profile_filters)
-                        self._mcp.logger.info(f"🎭 Applied profile '{profile_name}' for SSE session")
+                        saved_filters = dict(
+                            self._mcp.proxy.client_manager.tool_filters
+                        )
+                        self._mcp.proxy.client_manager.tool_filters.update(
+                            profile_filters
+                        )
+                        self._mcp.logger.info(
+                            f"🎭 Applied profile '{profile_name}' for SSE session"
+                        )
 
                 try:
                     async with self._sse.connect_sse(scope, receive, send) as streams:
@@ -852,7 +986,9 @@ class MultiMCP:
                 finally:
                     if saved_filters is not None:
                         self._mcp.proxy.client_manager.tool_filters = saved_filters
-                        self._mcp.logger.info(f"🎭 Restored global filters after profile session")
+                        self._mcp.logger.info(
+                            "🎭 Restored global filters after profile session"
+                        )
 
         handle_sse = _SSEHandler(self, sse)
 
@@ -877,7 +1013,33 @@ class MultiMCP:
                 if auth_error:
                     await auth_error(scope, receive, send)
                     return
-            await sse.handle_post_message(scope, receive, send)
+                if _content_length_exceeds(scope, MAX_HTTP_REQUEST_BODY_BYTES):
+                    response = JSONResponse(
+                        {"error": "Request body too large"}, status_code=413
+                    )
+                    await response(scope, receive, send)
+                    return
+
+            received_bytes = 0
+
+            async def receive_bounded():
+                nonlocal received_bytes
+                message = await receive()
+                if message.get("type") == "http.request":
+                    received_bytes += len(message.get("body", b""))
+                    if received_bytes > MAX_HTTP_REQUEST_BODY_BYTES:
+                        raise RequestBodyTooLarge(
+                            f"Request body exceeds {MAX_HTTP_REQUEST_BODY_BYTES} bytes"
+                        )
+                return message
+
+            try:
+                await sse.handle_post_message(scope, receive_bounded, send)
+            except RequestBodyTooLarge:
+                response = JSONResponse(
+                    {"error": "Request body too large"}, status_code=413
+                )
+                await response(scope, receive, send)
 
         starlette_app = Starlette(
             debug=self.settings.sse_server_debug,
@@ -912,6 +1074,7 @@ class MultiMCP:
             host=self.settings.host,
             port=self.settings.port,
             log_level=self.settings.log_level.lower(),
+            limit_concurrency=MAX_CONCURRENT_HTTP_REQUESTS,
         )
         server = uvicorn.Server(config)
         await server.serve()
@@ -927,10 +1090,18 @@ class MultiMCP:
 
         elif method == "POST":
             try:
-                payload = await request.json()
-            except json.JSONDecodeError:
+                payload = await _read_bounded_json(request)
+            except RequestBodyTooLarge:
+                return JSONResponse(
+                    {"error": "Request body too large"}, status_code=413
+                )
+            except (json.JSONDecodeError, UnicodeDecodeError):
                 return JSONResponse(
                     {"error": "Invalid JSON in request body"}, status_code=400
+                )
+            if not isinstance(payload, dict):
+                return JSONResponse(
+                    {"error": "JSON request body must be an object"}, status_code=400
                 )
             if "mcpServers" not in payload:
                 return JSONResponse(
@@ -941,7 +1112,15 @@ class MultiMCP:
             # Static config servers (from --config or YAML) bypass this check since
             # the user explicitly authored those URLs.
             servers = payload.get("mcpServers", {})
-            added = []
+            if not isinstance(servers, dict) or any(
+                not isinstance(name, str) or not isinstance(config, dict)
+                for name, config in servers.items()
+            ):
+                return JSONResponse(
+                    {"error": "'mcpServers' must map server names to objects"},
+                    status_code=422,
+                )
+
             for name, config in servers.items():
                 url = config.get("url")
                 if url:
@@ -952,13 +1131,37 @@ class MultiMCP:
                             f"⚠️ Rejected /mcp_servers POST — SSRF check failed for '{name}': {ssrf_err}"
                         )
                         return JSONResponse({"error": str(ssrf_err)}, status_code=403)
-                self.proxy.client_manager.add_pending_server(name, config)
-                added.append(name)
 
-            if not added:
+            if not servers:
                 return JSONResponse(
                     {"error": "No servers found in payload"}, status_code=400
                 )
+
+            # Keep the capacity check and registry mutation atomic across
+            # concurrent management requests so the retained-state cap cannot
+            # be crossed by racing additions.
+            async with self.proxy._register_lock:
+                configured_names = (
+                    set(self.proxy.client_manager.clients)
+                    | set(self.proxy.client_manager.pending_configs)
+                    | set(self.proxy.client_manager.server_configs)
+                )
+                new_names = set(servers) - configured_names
+                if len(configured_names) + len(new_names) > MAX_CONFIGURED_BACKENDS:
+                    return JSONResponse(
+                        {
+                            "error": (
+                                "Backend limit reached; remove a server before "
+                                f"adding more than {MAX_CONFIGURED_BACKENDS}"
+                            )
+                        },
+                        status_code=429,
+                    )
+
+                for name, config in servers.items():
+                    self.proxy.client_manager.add_pending_server(name, config)
+
+            added = list(servers)
 
             # Try to eagerly connect new servers for immediate availability
             try:
@@ -968,8 +1171,13 @@ class MultiMCP:
                 for name, client in new_clients.items():
                     await self.proxy.register_client(name, client)
                 # Rebuild the active retriever index after dynamic server add when supported.
-                if self.proxy.retrieval_pipeline is not None and self.proxy.tool_to_server:
-                    self.proxy.retrieval_pipeline.rebuild_catalog(self.proxy.tool_to_server)
+                if (
+                    self.proxy.retrieval_pipeline is not None
+                    and self.proxy.tool_to_server
+                ):
+                    self.proxy.retrieval_pipeline.rebuild_catalog(
+                        self.proxy.tool_to_server
+                    )
                 return JSONResponse({"message": f"Added {list(new_clients.keys())}"})
             except ValueError as e:
                 # Security validation failure (command not allowed, SSRF attempt, etc.)
@@ -979,7 +1187,9 @@ class MultiMCP:
                 self.logger.warning(
                     f"⚠️ Eager connect failed for {added}, will connect on first use: {connect_err}"
                 )
-                return JSONResponse({"message": f"Added {added} (pending lazy connect)"})
+                return JSONResponse(
+                    {"message": f"Added {added} (pending lazy connect)"}
+                )
 
         elif method == "DELETE":
             name = request.path_params.get("name")
@@ -988,8 +1198,7 @@ class MultiMCP:
                     {"error": "Missing client name in path"}, status_code=400
                 )
 
-            client = self.proxy.client_manager.clients.get(name)
-            if not client:
+            if not self.proxy.has_configured_server(name):
                 return JSONResponse(
                     {"error": f"No client named '{name}'"}, status_code=404
                 )
@@ -997,15 +1206,23 @@ class MultiMCP:
             try:
                 await self.proxy.unregister_client(name)
                 # Rebuild the active retriever index after dynamic server remove when supported.
-                if self.proxy.retrieval_pipeline is not None and self.proxy.tool_to_server:
-                    self.proxy.retrieval_pipeline.rebuild_catalog(self.proxy.tool_to_server)
+                if (
+                    self.proxy.retrieval_pipeline is not None
+                    and self.proxy.tool_to_server
+                ):
+                    self.proxy.retrieval_pipeline.rebuild_catalog(
+                        self.proxy.tool_to_server
+                    )
                 return JSONResponse(
                     {"message": f"Client '{name}' removed successfully"}
                 )
             except Exception as e:
                 self.logger.error(f"❌ Error removing MCP server '{name}': {e}")
                 return JSONResponse(
-                    {"error": "Internal server error", "detail": str(e) if self.settings.debug else None},
+                    {
+                        "error": "Internal server error",
+                        "detail": str(e) if self.settings.debug else None,
+                    },
                     status_code=500,
                 )
 
@@ -1023,7 +1240,10 @@ class MultiMCP:
         except Exception as e:
             self.logger.error(f"❌ Error in handle_mcp_tools: {e}")
             return JSONResponse(
-                {"error": "Internal server error", "detail": str(e) if self.settings.debug else None},
+                {
+                    "error": "Internal server error",
+                    "detail": str(e) if self.settings.debug else None,
+                },
                 status_code=500,
             )
 
@@ -1053,7 +1273,10 @@ class MultiMCP:
         except Exception as e:
             self.logger.error(f"❌ Error in handle_health: {e}")
             return JSONResponse(
-                {"error": "Internal server error", "detail": str(e) if self.settings.debug else None},
+                {
+                    "error": "Internal server error",
+                    "detail": str(e) if self.settings.debug else None,
+                },
                 status_code=500,
             )
 
@@ -1061,10 +1284,18 @@ class MultiMCP:
         """Handle POST /mcp_control for manual server enable/disable."""
         try:
             try:
-                payload = await request.json()
-            except json.JSONDecodeError:
+                payload = await _read_bounded_json(request)
+            except RequestBodyTooLarge:
+                return JSONResponse(
+                    {"error": "Request body too large"}, status_code=413
+                )
+            except (json.JSONDecodeError, UnicodeDecodeError):
                 return JSONResponse(
                     {"error": "Invalid JSON in request body"}, status_code=400
+                )
+            if not isinstance(payload, dict):
+                return JSONResponse(
+                    {"error": "JSON request body must be an object"}, status_code=400
                 )
             action = payload.get("action")
             server_name = payload.get("server")
@@ -1103,9 +1334,14 @@ class MultiMCP:
                         {"message": f"Server '{server_name}' enabled successfully"}
                     )
                 except Exception as e:
-                    self.logger.error(f"❌ Failed to enable server '{server_name}': {e}")
+                    self.logger.error(
+                        f"❌ Failed to enable server '{server_name}': {e}"
+                    )
                     return JSONResponse(
-                        {"error": "Failed to enable server", "detail": str(e) if self.settings.debug else None},
+                        {
+                            "error": "Failed to enable server",
+                            "detail": str(e) if self.settings.debug else None,
+                        },
                         status_code=500,
                     )
 
@@ -1126,9 +1362,14 @@ class MultiMCP:
                         {"message": f"Server '{server_name}' disabled successfully"}
                     )
                 except Exception as e:
-                    self.logger.error(f"❌ Failed to disable server '{server_name}': {e}")
+                    self.logger.error(
+                        f"❌ Failed to disable server '{server_name}': {e}"
+                    )
                     return JSONResponse(
-                        {"error": "Failed to disable server", "detail": str(e) if self.settings.debug else None},
+                        {
+                            "error": "Failed to disable server",
+                            "detail": str(e) if self.settings.debug else None,
+                        },
                         status_code=500,
                     )
 
@@ -1142,7 +1383,8 @@ class MultiMCP:
                     )
                 if enabled is None or not isinstance(enabled, bool):
                     return JSONResponse(
-                        {"error": "'enabled' must be a boolean (true/false)"}, status_code=400
+                        {"error": "'enabled' must be a boolean (true/false)"},
+                        status_code=400,
                     )
                 if not server_name:
                     return JSONResponse(
@@ -1161,12 +1403,17 @@ class MultiMCP:
 
                 try:
                     # Give proxy a reference to the YAML config for schema reconstruction
-                    self.proxy._yaml_config_ref = getattr(self, "_yaml_config_cache", None)
-                    result = await self.proxy.toggle_tool(server_name, tool_name, enabled)
+                    self.proxy._yaml_config_ref = getattr(
+                        self, "_yaml_config_cache", None
+                    )
+                    result = await self.proxy.toggle_tool(
+                        server_name, tool_name, enabled
+                    )
 
                     # Persist to YAML (best-effort — runtime state already updated)
                     try:
                         from src.multimcp.yaml_config import load_config, save_config
+
                         cfg = load_config(YAML_CONFIG_PATH)
                         srv = cfg.servers.get(server_name)
                         if srv and tool_name in srv.tools:
@@ -1181,19 +1428,27 @@ class MultiMCP:
                 except Exception as e:
                     self.logger.error(f"❌ Failed to toggle tool '{tool_name}': {e}")
                     return JSONResponse(
-                        {"error": "Failed to toggle tool", "detail": str(e) if self.settings.debug else None},
+                        {
+                            "error": "Failed to toggle tool",
+                            "detail": str(e) if self.settings.debug else None,
+                        },
                         status_code=500,
                     )
 
             else:
                 return JSONResponse(
-                    {"error": f"Invalid action: {action}. Use 'enable', 'disable', or 'toggle_tool'"},
+                    {
+                        "error": f"Invalid action: {action}. Use 'enable', 'disable', or 'toggle_tool'"
+                    },
                     status_code=400,
                 )
 
         except Exception as e:
             self.logger.error(f"❌ Error in handle_mcp_control: {e}")
             return JSONResponse(
-                {"error": "Internal server error", "detail": str(e) if self.settings.debug else None},
+                {
+                    "error": "Internal server error",
+                    "detail": str(e) if self.settings.debug else None,
+                },
                 status_code=500,
             )

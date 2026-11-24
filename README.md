@@ -2,7 +2,7 @@
 
 A production-ready MCP proxy server that aggregates multiple backend MCP servers into a single endpoint — with lazy loading, per-tool filtering, and a unified YAML config that doubles as a live control plane.
 
-```
+```text
 All your AI tools → multi-mcp → github, obsidian, exa, tavily, context7, ...
 ```
 
@@ -69,46 +69,49 @@ On first run, multi-mcp creates `~/.config/multi-mcp/servers.yaml` by connecting
 servers:
   github:
     command: /path/to/run-github.sh
-    always_on: true          # stays connected at all times
+    always_on: true # stays connected at all times
     idle_timeout_minutes: 5
     tools:
       search_repositories:
         enabled: true
       delete_repository:
-        enabled: false        # hidden from all AI tools
+        enabled: false # hidden from all AI tools
       create_gist:
         enabled: false
 
   exa:
     url: https://mcp.exa.ai/mcp?tools=web_search_exa,get_code_context_exa
-    always_on: false          # lazy: connects only when called
+    always_on: false # lazy: connects only when called
     idle_timeout_minutes: 5
-    tool_call_timeout_seconds: 60   # optional: fail hung tool calls after 60s
+    operation_timeout_seconds: 30 # deadline for every backend operation
+    tool_call_timeout_seconds: 60 # optional tool-specific override
+    max_catalog_items: 1000 # cap each backend capability catalog
     tools:
       web_search_exa:
         enabled: true
       linkedin_search_exa:
-        enabled: false        # don't need this
+        enabled: false # don't need this
 
   obsidian:
     command: /path/to/run-obsidian.sh
     always_on: true
-    tools: {}                 # auto-populated on first run
+    tools: {} # auto-populated on first run
 ```
 
 **Tool control rules:**
 
-| State | Behavior |
-|-------|----------|
-| `enabled: true` | Exposed to AI |
-| `enabled: false` | Hidden — setting is never overwritten by refresh |
-| Tool disappears from server | Marked `stale: true`, your setting preserved |
-| `stale: true` + `enabled: false` | Cleaned up on next refresh |
-| No `tools` key | All tools pass through (default) |
+| State                            | Behavior                                         |
+| -------------------------------- | ------------------------------------------------ |
+| `enabled: true`                  | Exposed to AI                                    |
+| `enabled: false`                 | Hidden — setting is never overwritten by refresh |
+| Tool disappears from server      | Marked `stale: true`, your setting preserved     |
+| `stale: true` + `enabled: false` | Cleaned up on next refresh                       |
+| No `tools` key                   | All tools pass through (default)                 |
 
 To disable a tool, just set `enabled: false` and save. Takes effect on next `multi-mcp start`.
 
-**Per-server timeouts:** set `tool_call_timeout_seconds` on a server to bound how long a tool call may take. When unset (default), calls wait indefinitely. When set, a hung backend returns a timeout error instead of stalling the request, and repeated timeouts trip the proxy's circuit breaker (auto-quarantine after 3 consecutive failures).
+**Per-server resource limits:** every backend operation has a finite 30-second deadline by default. Set `operation_timeout_seconds` to tune it for a server, or `tool_call_timeout_seconds` for a tool-call-specific override. `max_catalog_items` limits each tools, prompts, or resources catalog to 1,000 entries by default. The runtime management API accepts at most 100 configured backends.
+Hung tool calls return an error, and repeated timeouts trip the proxy's circuit breaker (auto-quarantine after 3 consecutive failures).
 
 ---
 
@@ -147,19 +150,28 @@ uv run python main.py list --disabled
 Once multi-mcp is running, replace all individual server entries in your tool configs with a single entry:
 
 **Claude Code / Cursor / any JSON-based config:**
+
 ```json
 {
   "mcpServers": {
     "multi-mcp": {
       "type": "stdio",
       "command": "uv",
-      "args": ["run", "--project", "/path/to/multi-mcp", "python", "main.py", "start"]
+      "args": [
+        "run",
+        "--project",
+        "/path/to/multi-mcp",
+        "python",
+        "main.py",
+        "start"
+      ]
     }
   }
 }
 ```
 
 **SSE mode (if running as a background service):**
+
 ```json
 {
   "mcpServers": {
@@ -177,11 +189,11 @@ Once multi-mcp is running, replace all individual server entries in your tool co
 
 multi-mcp connects to backend servers over any transport:
 
-| Transport | Backend config | Notes |
-|-----------|---------------|-------|
-| **stdio** | `command: /path/to/server` | Local subprocess |
-| **Streamable HTTP** | `url: https://...` | Current MCP spec (POST) |
-| **SSE** | `url: https://...` | Legacy SSE (GET), auto-fallback |
+| Transport           | Backend config             | Notes                           |
+| ------------------- | -------------------------- | ------------------------------- |
+| **stdio**           | `command: /path/to/server` | Local subprocess                |
+| **Streamable HTTP** | `url: https://...`         | Current MCP spec (POST)         |
+| **SSE**             | `url: https://...`         | Legacy SSE (GET), auto-fallback |
 
 For `url`-based servers, multi-mcp tries Streamable HTTP first and falls back to legacy SSE automatically.
 
@@ -215,7 +227,7 @@ Authenticate with `Authorization: Bearer <key>` (set `MULTI_MCP_API_KEY` env var
 
 ## Architecture
 
-```
+```text
 ┌──────────────────────────────────────────────────┐
 │  Claude Code / Codex / Cursor / any MCP client   │
 └─────────────────────┬────────────────────────────┘
@@ -269,11 +281,11 @@ uv run python main.py list
 
 ## Environment Variables
 
-| Variable | Description |
-|----------|-------------|
-| `MULTI_MCP_API_KEY` | Bearer token for SSE API auth |
-| `MULTI_MCP_HOST` | SSE bind host (default: `127.0.0.1`) |
-| `MULTI_MCP_PORT` | SSE bind port (default: `8085`) |
+| Variable              | Description                            |
+| --------------------- | -------------------------------------- |
+| `MULTI_MCP_API_KEY`   | Bearer token for SSE API auth          |
+| `MULTI_MCP_HOST`      | SSE bind host (default: `127.0.0.1`)   |
+| `MULTI_MCP_PORT`      | SSE bind port (default: `8085`)        |
 | `MULTI_MCP_LOG_LEVEL` | Log level: DEBUG, INFO, WARNING, ERROR |
 
 ---
